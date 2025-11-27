@@ -1,0 +1,24 @@
+# Julia artifacts
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.ji
+*.ipynb
+
+# Editor and OS cruft
+.vscode/
+.idea/
+GermanBC/
+PBC/
+history/
+.DS_Store
+Thumbs.db
+
+# Generated outputs
+results/
+*.jls
+*.pdf
+*.png
+
+# Notebook auto-saves
+*.ipynb_checkpoints/

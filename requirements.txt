@@ -1,0 +1,9 @@
+# Julia environment (add via Julia's package manager)
+julia>=1.9
+DataFrames
+CSV
+Distributions
+ProgressMeter
+VectorizedStatistics
+StatsBase
+MLDataUtils
