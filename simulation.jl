@@ -12,6 +12,9 @@ using ProgressMeter
 using StatsBase
 using Statistics
 using Base.Threads
+using Plots
+using StatsPlots
+using CategoricalArrays
 
 include(joinpath(@__DIR__, "config.jl"))
 include(joinpath(@__DIR__, "model.jl"))
@@ -25,25 +28,31 @@ struct SimulationTask
     idx::Int        # replication id
 end
 
-# Parse command-line flags (--demo/--full/--reset/--workers=N).
+# Parse command-line flags (--demo/--full/--reset/--replot/--plot-only/--workers=N).
 function parse_args()
-    mode = SimulationMode.full
+    mode = Config.full
     reset = false
+    replot = false
+    plot_only = false
     workers = nthreads()
 
     for arg in ARGS
         if arg == "--demo"
-            mode = SimulationMode.demo
+            mode = Config.demo
         elseif arg == "--full"
-            mode = SimulationMode.full
+            mode = Config.full
         elseif arg == "--reset"
             reset = true
+        elseif arg == "--replot"
+            replot = true
+        elseif arg == "--plot-only"
+            plot_only = true
         elseif startswith(arg, "--workers=")
             workers = parse(Int, split(arg, "=")[2])
         end
     end
 
-    return mode, reset, workers
+    return mode, reset, replot, plot_only, workers
 end
 
 # Synthetic survival data generator mirroring the notebook setup.
@@ -56,6 +65,8 @@ function data_gen(random_seed; g_type::String="sin", n::Int=200, hazard_a::Float
             z -> sin.(z)
         elseif g_type == "quad"
             z -> -z .* (z .- 2pi) / 5
+        elseif g_type == "linear"
+            z -> 0.3 .* z
         elseif g_type == "U-quad"
             z -> z .* (z .- 2pi) / 5
         else
@@ -92,6 +103,23 @@ function data_gen(random_seed; g_type::String="sin", n::Int=200, hazard_a::Float
         cen_rate=cen_rate,
     )
 end
+
+# True g(z) helper for plotting.
+function g_true_values(g_type::String, z::AbstractVector{<:Real})
+    if g_type == "sin"
+        return sin.(z)
+    elseif g_type == "quad"
+        return -z .* (z .- 2pi) ./ 5
+    elseif g_type == "linear"
+        return 0.3 .* z
+    elseif g_type == "U-quad"
+        return z .* (z .- 2pi) ./ 5
+    else
+        return 1 ./(1 .+ exp.(2 .* (pi .- z)))
+    end
+end
+
+baseline_cumhaz(t::AbstractVector{<:Real}, a::Real, b::Real) = a .* (t .^ b)
 
 function ensure_results_dir(base_dir::String)
     if !isdir(base_dir)
@@ -132,10 +160,11 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     X_test = Matrix(df_test[:, [:X1, :X2]])
     Z_test = df_test.Z
 
-    a, b = minimum(Z_train), maximum(Z_train)
+    # Use known support for Z to avoid boundary bias/kinks when plotting on full grid.
+    a, b = cfg.z_min, cfg.z_max
 
-    results_nonlinear = RJMCMC_Nonlinear(X_train, Z_train, Delta_train, Y_train, a, b, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX)
-    results_coxph = RJMCMC_CoxPH(X_train, Z_train, Delta_train, Y_train, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX)
+    results_nonlinear = RJMCMC_Nonlinear(X_train, Z_train, Delta_train, Y_train, a, b, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX, Hcan=20, Kcan=20)
+    results_coxph = RJMCMC_CoxPH(X_train, Z_train, Delta_train, Y_train, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Hcan=20)
 
     ns = results_nonlinear["ns"]
     bi = results_nonlinear["burn_in"]
@@ -155,14 +184,37 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     end
     g_pos ./= (ns - bi)
 
+    # Evaluate Λ following notebook approach: only evaluate for t <= Tmax per iteration
+    # Match notebook Cell 7: t_grid_reduced = t_grid[t_grid .<= Tmax]
     Lambda_nonlinear = zeros(length(t_grid))
+    Lambda_nz_nonlinear = zeros(length(t_grid))
     for i in (bi + 1):ns
         H = Int(H_all[i])
         taus = taus_all[1:H, i]
         gammas = gammas_all[1:(H + 2), i]
-        Lambda_nonlinear .+= Lambda_fun_est(t_grid, Tmax, taus, gammas)
+        tau_i = Tmax  # Use Tmax as tau for this iteration
+        
+        # Only evaluate for points <= Tmax (matching notebook)
+        valid_mask = t_grid .<= tau_i
+        if any(valid_mask)
+            t_grid_reduced = t_grid[valid_mask]
+            est = Lambda_fun_est(t_grid_reduced, tau_i, taus, gammas)
+            
+            # Pad with zeros if needed (matching notebook logic)
+            if length(est) < length(t_grid)
+                est_full = zeros(length(t_grid))
+                est_full[valid_mask] = est
+            else
+                est_full = est
+            end
+            
+            Lambda_nonlinear .+= est_full
+            Lambda_nz_nonlinear .+= valid_mask
+        end
     end
-    Lambda_nonlinear ./= (ns - bi)
+    # Average only over iterations that contributed (matching notebook)
+    Lambda_nonlinear = Lambda_nonlinear ./ max.(Lambda_nz_nonlinear, 1.0)
+    Lambda_nonlinear = accumulate(max, Lambda_nonlinear)
 
     H_cox_all, taus_cox_all, gammas_cox_all = results_coxph["H"], results_coxph["taus"], results_coxph["gammas"]
     Lambda_coxph = zeros(length(t_grid))
@@ -170,9 +222,13 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
         H = Int(H_cox_all[i])
         taus = taus_cox_all[1:H, i]
         gammas = gammas_cox_all[1:(H + 2), i]
-        Lambda_coxph .+= Lambda_fun_est(t_grid, Tmax, taus, gammas)
+        tau_i = Tmax  # Use Tmax as tau for this iteration
+        
+        # Evaluate for all points (CoxPH uses full t_grid in notebook)
+        Lambda_coxph .+= Lambda_fun_est(t_grid, tau_i, taus, gammas)
     end
     Lambda_coxph ./= (ns - bi)
+    Lambda_coxph = accumulate(max, Lambda_coxph)
 
     IBS_coxph = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_coxph, "coxph")
     IBS_nonlinear = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_nonlinear, "nonlinear")
@@ -191,7 +247,7 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
         "Hseq_coxph" => results_coxph["H"][bi+1:ns],
         "ns" => ns,
         "burn_in" => bi,
-        "mode" => String(cfg.mode),
+        "mode" => string(cfg.mode),
     )
 
     open(results_path, "w") do file
@@ -203,6 +259,8 @@ end
 
 # Aggregate posterior summaries and IBS metrics across completed replications.
 function summarize_tasks(cfg::SimulationConfig, base_dir::String)
+    plots_dir = joinpath(base_dir, "plots")
+    mkpath(plots_dir)
     df_summary = DataFrame(
         G_type=String[],
         N=Int[],
@@ -242,6 +300,10 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
             cr1_coxph = Float64[]
             cr2_coxph = Float64[]
 
+            g_samples = Vector{Vector{Float64}}()
+            lambda_non_samples = Vector{Vector{Float64}}()
+            lambda_cox_samples = Vector{Vector{Float64}}()
+
             for idx in 1:cfg.replications
                 path = joinpath(task_dir(base_dir, SimulationTask(g_type, n, idx)), "results_dict.jls")
                 if !isfile(path)
@@ -273,6 +335,9 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 push!(betas_coxph_mat2, mean(results_dict["beta_coxph"][2, (bi+1):ns]))
                 push!(betas_se_coxph_mat2, std(results_dict["beta_coxph"][2, (bi+1):ns]))
                 push!(H_coxph, mean(results_dict["Hseq_coxph"]))
+                push!(g_samples, results_dict["g_nonlinear"])
+                push!(lambda_non_samples, results_dict["Lambda_nonlinear"])
+                push!(lambda_cox_samples, results_dict["Lambda_coxph"])
 
                 cr1c = quantile(results_dict["beta_coxph"][1, (bi+1):ns], [0.025, 0.975])
                 push!(cr1_coxph, cr1c[1] <= 0.5 <= cr1c[2])
@@ -315,6 +380,36 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                     mean(H_coxph),
                     0.0,
                 ))
+
+                # --- Plotting (PDF) ---
+                z_grid = cfg.z_grid
+                t_grid = cfg.t_grid
+                g_truth = g_true_values(g_type, z_grid)
+                baseline = baseline_cumhaz(t_grid, cfg.hazard_a, cfg.hazard_b)
+
+                if !isempty(g_samples)
+                    g_mat = hcat(g_samples...)
+                    g_mean = vec(mean(g_mat, dims=2))
+
+                    plt_g = plot(z_grid, g_truth; lw=2, color=:blue, label="True")
+                    plot!(plt_g, z_grid, g_mean; lw=2, color=:red, label="NonLinear")
+                    xlabel!(plt_g, "z")
+                    ylabel!(plt_g, "g(z)")
+                    title!(plt_g, "n = $(n)")
+                    savefig(plt_g, joinpath(plots_dir, "g_$(g_type)_n$(n).pdf"))
+                end
+
+                if !isempty(lambda_non_samples)
+                    lam_non_mat = hcat(lambda_non_samples...)
+                    lam_non_mean = vec(mean(lam_non_mat, dims=2))
+
+                    plt_lam = plot(t_grid, baseline; lw=2, color=:blue, label="True")
+                    plot!(plt_lam, t_grid, lam_non_mean; lw=2, color=:red, label="NonLinear")
+                    xlabel!(plt_lam, "t")
+                    ylabel!(plt_lam, "Λ(t)")
+                    title!(plt_lam, "n = $(n)")
+                    savefig(plt_lam, joinpath(plots_dir, "lambda_$(g_type)_n$(n).pdf"))
+                end
             end
         end
     end
@@ -323,16 +418,198 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
     CSV.write(joinpath(base_dir, "df_IBS.csv"), df_IBS_summary)
 end
 
+# -------------------------------------------------------------------------
+# Manuscript-style plots (Figures 1-4) with CoxPH comparisons
+# -------------------------------------------------------------------------
+function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
+    plot_dir = joinpath(base_dir, "plots_manuscript")
+    mkpath(plot_dir)
+
+    baseline = baseline_cumhaz(cfg.t_grid, cfg.hazard_a, cfg.hazard_b)
+    ibs_rows = DataFrame(g_type=String[], n=Int[], Method=String[], IBS=Float64[])
+
+    # Cache means per (g, n)
+    lam_non_means = Dict{Tuple{String,Int}, Vector{Float64}}()
+    lam_cox_means = Dict{Tuple{String,Int}, Union{Vector{Float64},Nothing}}()
+    g_non_means = Dict{Tuple{String,Int}, Vector{Float64}}()
+
+    for g_type in cfg.g_types
+        for n in cfg.n_values
+            lam_non_list = Vector{Vector{Float64}}()
+            lam_cox_list = Vector{Vector{Float64}}()
+            g_non_list = Vector{Vector{Float64}}()
+
+            # Collect only existing replications (use max up to cfg.replications but skip missing)
+            found_any = false
+            for idx in 1:cfg.replications
+                path = joinpath(task_dir(base_dir, SimulationTask(g_type, n, idx)), "results_dict.jls")
+                if !isfile(path)
+                    continue
+                end
+                found_any = true
+                file = open(path, "r")
+                data = deserialize(file)
+                close(file)
+
+                push!(lam_non_list, data["Lambda_nonlinear"])
+                push!(g_non_list, data["g_nonlinear"])
+                if haskey(data, "Lambda_coxph")
+                    push!(lam_cox_list, data["Lambda_coxph"])
+                end
+                if haskey(data, "IBS_nonlinear")
+                    push!(ibs_rows, (g_type, n, "NonLinear", data["IBS_nonlinear"]))
+                end
+                if haskey(data, "IBS_coxph")
+                    push!(ibs_rows, (g_type, n, "CoxPH", data["IBS_coxph"]))
+                end
+            end
+
+            if !found_any
+                @warn "No results found for g=$(g_type), n=$(n) in $(base_dir); plots may be empty. Rerun simulations for this setting."
+                continue
+            end
+
+            if !isempty(lam_non_list)
+                lam_non_means[(g_type, n)] = vec(mean(hcat(lam_non_list...), dims=2))
+            end
+            if !isempty(lam_cox_list)
+                lam_cox_means[(g_type, n)] = vec(mean(hcat(lam_cox_list...), dims=2))
+            else
+                lam_cox_means[(g_type, n)] = nothing
+            end
+            if !isempty(g_non_list)
+                g_non_means[(g_type, n)] = vec(mean(hcat(g_non_list...), dims=2))
+            end
+        end
+    end
+
+    # Figures for each g_type
+    for g_type in cfg.g_types
+        # Collect available n values for this g_type
+        available_n_lam = [n for n in cfg.n_values if haskey(lam_non_means, (g_type, n))]
+        available_n_g = [n for n in cfg.n_values if haskey(g_non_means, (g_type, n))]
+        
+        # Λ panels - only plot available n values
+        if !isempty(available_n_lam)
+            n_lam_count = length(available_n_lam)
+            lam_layout = (1, n_lam_count)
+            p_lam = plot(layout=lam_layout, size=(400 * n_lam_count, 400), legend=:topright)
+            for (i, n) in enumerate(available_n_lam)
+                lam_non = lam_non_means[(g_type, n)]
+                plt = plot(cfg.t_grid, baseline; color=:black, lw=2, label=i == 1 ? "True" : "", legend=:topright)
+                plot!(plt, cfg.t_grid, lam_non; color=:red, lw=2, label=i == 1 ? "NonLinear" : "", linestyle=:dash)
+                title!(plt, "n = $(n)")
+                xlabel!(plt, "t")
+                ylabel!(plt, "Λ(t)")
+                plot!(p_lam, plt, subplot=i)
+            end
+            savefig(p_lam, joinpath(plot_dir, "Lambda_$(g_type).pdf"))
+            println("Generated Lambda plot for g=$(g_type) with $(n_lam_count) sample size(s): $(available_n_lam)")
+        else
+            @warn "No Lambda data available for g=$(g_type); skipping plot."
+        end
+
+        # g(z) panels (only NonLinear estimated) - only plot available n values
+        if !isempty(available_n_g)
+            n_g_count = length(available_n_g)
+            g_layout = (1, n_g_count)
+            p_g = plot(layout=g_layout, size=(400 * n_g_count, 400), legend=:topright)
+            g_true = g_true_values(g_type, cfg.z_grid)
+            for (i, n) in enumerate(available_n_g)
+                g_non = g_non_means[(g_type, n)]
+                plt = plot(cfg.z_grid, g_true; color=:black, lw=2, label=i == 1 ? "True" : "", legend=:topright)
+                plot!(plt, cfg.z_grid, g_non; color=:red, lw=2, label=i == 1 ? "NonLinear" : "", linestyle=:dash)
+                title!(plt, "n = $(n)")
+                xlabel!(plt, "z")
+                ylabel!(plt, "g(z)")
+                plot!(p_g, plt, subplot=i)
+            end
+            savefig(p_g, joinpath(plot_dir, "g_$(g_type).pdf"))
+            println("Generated g(z) plot for g=$(g_type) with $(n_g_count) sample size(s): $(available_n_g)")
+        else
+            @warn "No g(z) data available for g=$(g_type); skipping plot."
+        end
+    end
+
+    # IBS boxplot (Figure 4 style) - only plot g_types with data
+    if !isempty(ibs_rows)
+        df_ibs = ibs_rows
+        df_ibs.n_str = string.(df_ibs.n)
+        df_ibs.Method = categorical(df_ibs.Method, ordered=true, levels=["CoxPH", "NonLinear"])
+        
+        # Collect g_types that have IBS data
+        available_g_types_ibs = unique(df_ibs.g_type)
+        if !isempty(available_g_types_ibs)
+            n_g_types = length(available_g_types_ibs)
+            p_ibs = plot(layout=(1, n_g_types), size=(600 * n_g_types, 500), legend=:topright)
+            colors = [:pink, :teal]
+            for (i, g_type) in enumerate(available_g_types_ibs)
+                subdf = df_ibs[df_ibs.g_type .== g_type, :]
+                if nrow(subdf) > 0
+                    plt = @df subdf boxplot(:n_str, :IBS, group=:Method, legend=i == 1 ? :topright : false, palette=colors)
+                    title!(plt, string(uppercasefirst(g_type)))
+                    xlabel!(plt, "n")
+                    ylabel!(plt, "IBS")
+                    plot!(p_ibs, plt, subplot=i)
+                end
+            end
+            savefig(p_ibs, joinpath(plot_dir, "IBS_boxplots.pdf"))
+            println("Generated IBS boxplot with $(n_g_types) g_type(s): $(available_g_types_ibs)")
+        else
+            @warn "No IBS data available for plotting."
+        end
+    else
+        @warn "IBS table empty; rerun simulations to populate IBS metrics."
+    end
+end
+
+# Generate plots only (without running simulations)
+function generate_plots_only(mode::SimulationMode=Config.demo)
+    cfg = default_simulation_config(mode)
+    base_dir = joinpath(RESULTS_DIR, "simulation", string(cfg.mode))
+    
+    if !isdir(base_dir)
+        @warn "Results directory $(base_dir) does not exist. Run simulations first."
+        return
+    end
+    
+    println("Generating plots from existing results in $(base_dir)...")
+    summarize_tasks(cfg, base_dir)
+    generate_manuscript_plots(cfg, base_dir)
+    println("Plot generation finished. Results saved to $(base_dir)")
+end
+
 # CLI entry point.
 function main()
-    mode, reset, workers = parse_args()
+    mode, reset, replot, plot_only, workers = parse_args()
+    
+    # If --plot-only is set, only generate plots without running simulations
+    if plot_only
+        generate_plots_only(mode)
+        return
+    end
+    
     cfg = default_simulation_config(mode; n_workers=workers)
-    base_dir = joinpath(RESULTS_DIR, "simulation", String(cfg.mode))
+    base_dir = joinpath(RESULTS_DIR, "simulation", string(cfg.mode))
 
     if reset && isdir(base_dir)
         rm(base_dir; recursive=true, force=true)
     end
     ensure_results_dir(base_dir)
+    
+    # If --replot is set, delete existing plot directories to force regeneration
+    if replot
+        plots_dir = joinpath(base_dir, "plots")
+        plots_manuscript_dir = joinpath(base_dir, "plots_manuscript")
+        if isdir(plots_dir)
+            rm(plots_dir; recursive=true, force=true)
+            println("Deleted existing plots directory for regeneration.")
+        end
+        if isdir(plots_manuscript_dir)
+            rm(plots_manuscript_dir; recursive=true, force=true)
+            println("Deleted existing plots_manuscript directory for regeneration.")
+        end
+    end
 
     tasks = SimulationTask[]
     for g in cfg.g_types
@@ -351,7 +628,7 @@ function main()
     n_active_threads = min(cfg.n_workers, nthreads())
     println("Running simulations with $n_active_threads threads (set JULIA_NUM_THREADS to change).")
     prog = Progress(length(tasks); desc="Simulations")
-    lock = ReentrantLock()
+    progress_lock = ReentrantLock()
     limit = max(1, min(cfg.n_workers, nthreads()))
     sem = Base.Semaphore(limit)
 
@@ -361,7 +638,7 @@ function main()
                 Base.acquire(sem)
                 try
                     run_single_task(task, cfg, base_dir)
-                    lock() do
+                    lock(progress_lock) do
                         next!(prog)
                     end
                 finally
@@ -372,6 +649,7 @@ function main()
     end
 
     summarize_tasks(cfg, base_dir)
+    generate_manuscript_plots(cfg, base_dir)
     println("Simulation finished. Results saved to $(base_dir)")
 end
 

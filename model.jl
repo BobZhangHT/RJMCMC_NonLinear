@@ -59,6 +59,7 @@ end
 
 # Integrated hazard Λ(t) corresponding to the piecewise log-λ definition.
 function Lambda_fun_est(t, tau, taus, gammas)
+    # Match historical formulation (model1229): clamp t to [0, tau] to avoid extrapolation.
     t = ifelse.(t .> tau, tau, t)
     taus_ = [0 taus' tau][1,:]
     H = size(taus)[1]
@@ -93,7 +94,9 @@ function RJMCMC_Nonlinear(
         RJMCMC_indicator::Bool=true,
         Adapt_C::Bool=true,
         Hmax::Int=DEFAULT_HMAX,
-        Kmax::Int=DEFAULT_KMAX
+        Kmax::Int=DEFAULT_KMAX,
+        Hcan::Int=20,
+        Kcan::Int=20
      )
 
     NS = ns
@@ -168,8 +171,10 @@ function RJMCMC_Nonlinear(
     Random.seed!(random_seed)
 	
     # prior: baseline hazard
-    # equally spaced taus
-    taus = LinRange(0,tau,H+2)[2:(H+1)]
+    # candidate pool for taus
+    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
+    # sample from candidate pool
+    taus = H > 0 ? sort(sample(taus_can, H, replace=false)) : Float64[]
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -179,7 +184,10 @@ function RJMCMC_Nonlinear(
     end  
     
     # prior: smooth function
-    zetas = LinRange(a, b, K+2)[2:(K+1)]
+    # candidate pool for zetas
+    zetas_can = LinRange(a, b, Kcan+2)[2:(Kcan+1)]
+    # sample from candidate pool
+    zetas = K > 0 ? sort(sample(zetas_can, K, replace=false)) : Float64[]
     zetas_ = [a zetas' b][1,:]
     
     xis = zeros(K+2)
@@ -272,10 +280,12 @@ function RJMCMC_Nonlinear(
         # ----------------------------- Update Tau -----------------------------
         taus_ = [0 taus' tau][1,:]
         taus_star = copy(taus_)
+        taus_star_replace = copy(taus_)
                 
         if H > 0
              hc = rand(1:H)
              tau_hc_star = rand(Uniform(taus_star[hc],taus_star[hc+2]))
+             taus_star_replace[hc+1] = tau_hc_star
              log_de = loglkh_cal(X,Z,Delta,Y, 
                                         betas,
                                         tau,
@@ -284,12 +294,10 @@ function RJMCMC_Nonlinear(
                                         a,b,zetas,xis) +
                      　　　　log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
             
-             taus_star[hc+1] = tau_hc_star
-            
              log_num = loglkh_cal(X,Z,Delta,Y, 
                                         betas,
                                         tau,
-                                        taus_star[2:(H+1)], 
+                                        taus_star_replace[2:(H+1)], 
                                         gammas_star,
                                         a,b,zetas,xis) + 
                             log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc])
@@ -551,10 +559,12 @@ function RJMCMC_Nonlinear(
         # ----------------------------- Update Zetas -----------------------------
         zetas_ = [a zetas' b][1,:]
         zetas_star = copy(zetas_)
+        zetas_star_replace = copy(zetas_)
 		
         if K > 0
              kc = rand(1:K)
              zeta_kc_star = rand(Uniform(zetas_star[kc],zetas_star[kc+2]))
+             zetas_star_replace[kc+1] = zeta_kc_star
              log_de = loglkh_cal(X,Z,Delta,Y, 
 								betas,
 								tau,
@@ -565,15 +575,13 @@ function RJMCMC_Nonlinear(
 								xis_star) +
                      　　　　log(zetas_star[kc+2] - zetas_star[kc+1]) + log(zetas_star[kc+1] - zetas_star[kc])
             
-             zetas_star[kc+1] = zeta_kc_star
-            
              log_num = loglkh_cal(X,Z,Delta,Y, 
                                         betas,
                                         tau,
                                         taus, 
                                         gammas,
                                         a,b,
-										zetas_star[2:(K+1)],
+										zetas_star_replace[2:(K+1)],
 										xis_star) + 
                             log(zetas_star[kc+2] - zeta_kc_star) + log(zeta_kc_star - zetas_star[kc])
                     
@@ -581,7 +589,7 @@ function RJMCMC_Nonlinear(
              acc_prob = min(1, aratio)
              # accept or not
              acc = rand() < acc_prob
-             # update the taus
+             # update the zetas
              zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1] 
         end
     
@@ -833,7 +841,8 @@ function RJMCMC_CoxPH(
         burn_in::Int=DEFAULT_BURN_IN,
         RJMCMC_indicator::Bool=true,
         Adapt_C::Bool=true,
-        Hmax::Int=DEFAULT_HMAX
+        Hmax::Int=DEFAULT_HMAX,
+        Hcan::Int=20
      )
 
     NS = ns
@@ -902,8 +911,10 @@ function RJMCMC_CoxPH(
     Random.seed!(random_seed)
     
     # prior: baseline hazard
-    # equally spaced taus
-	taus = LinRange(0,tau,H+2)[2:(H+1)]
+    # candidate pool for taus
+    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
+    # sample from candidate pool
+    taus = H > 0 ? sort(sample(taus_can, H, replace=false)) : Float64[]
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -981,10 +992,12 @@ function RJMCMC_CoxPH(
         # ----------------------------- Update Tau -----------------------------
         taus_ = [0 taus' tau][1,:]
         taus_star = copy(taus_)
+        taus_star_replace = copy(taus_)
 
 		if H > 0
              hc = rand(1:H)
              tau_hc_star = rand(Uniform(taus_star[hc],taus_star[hc+2]))
+             taus_star_replace[hc+1] = tau_hc_star
              log_de = coxph_loglkh_cal(X,Delta,Y,  
 								betas,
 								tau,
@@ -992,12 +1005,10 @@ function RJMCMC_CoxPH(
 								gammas_star) +
                      　　　　log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
             
-             taus_star[hc+1] = tau_hc_star
-            
              log_num = coxph_loglkh_cal(X,Delta,Y, 
 								betas,
 								tau,
-								taus_star[2:(H+1)], 
+								taus_star_replace[2:(H+1)], 
 								gammas_star) + 
                             log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc])
                     

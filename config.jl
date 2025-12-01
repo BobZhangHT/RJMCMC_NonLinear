@@ -1,13 +1,14 @@
 module Config
 
-# Centralized configuration structures and defaults shared by simulations and real data scripts.
+# Centralized configuration structures and defaults shared by simulations and real-data scripts.
 
 export SimulationMode, SimulationConfig, default_simulation_config, RealDataConfig, real_data_config, RESULTS_DIR
 
-using Dates
+using Base.Threads
 
 # Location to store all generated artifacts (results/ is gitignored).
-const RESULTS_DIR = "results"
+# Anchor to repository directory so running from other working dirs still works.
+const RESULTS_DIR = joinpath(@__DIR__, "results")
 
 @enum SimulationMode begin
     demo
@@ -41,18 +42,19 @@ struct RealDataConfig
 end
 
 """
-    default_simulation_config(mode=SimulationMode.full; n_workers=max(1, Threads.nthreads()))
+    default_simulation_config(mode=full; n_workers=max(1, Threads.nthreads()))
 
-Return a ready-to-use simulation configuration. `demo` keeps everything light-weight,
-`full` mirrors the original notebook defaults.
+Return a ready-to-use simulation configuration. `demo` keeps the same sampler settings
+as the notebooks but uses fewer replications; `full` mirrors the original defaults.
 """
-function default_simulation_config(mode::SimulationMode=SimulationMode.full; n_workers::Int=max(1, Threads.nthreads()))
-    # match sampler posterior settings in model0109.jl / RJMCMC-SIMU.ipynb
+function default_simulation_config(mode::SimulationMode=full; n_workers::Int=max(1, Threads.nthreads()))
     ns = 5000
     n_test = 500
-    g_types = ["logit", "sin"]
-    n_values = [200, 400， 800]
-    replications = mode == SimulationMode.demo ? 10 : 1000
+    g_types = ["linear", "quad", "sin"]
+    # Demo: only n=200; Full: all manuscript sizes.
+    n_values = mode == demo ? [200] : [200, 400, 800]
+    # Use a light footprint for demo, full manuscript settings use 1000 reps.
+    replications = mode == demo ? 10 : 1000
 
     burn_in = ns ÷ 2
     SimulationConfig(
