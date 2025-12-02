@@ -15,6 +15,8 @@ using Base.Threads
 using Plots
 using StatsPlots
 using CategoricalArrays
+using LaTeXStrings
+using SpecialFunctions  # Required by model.jl for Dirichlet prior
 
 include(joinpath(@__DIR__, "config.jl"))
 include(joinpath(@__DIR__, "model.jl"))
@@ -34,6 +36,7 @@ function parse_args()
     reset = false
     replot = false
     plot_only = false
+    # Default to use all available CPU threads
     workers = nthreads()
 
     for arg in ARGS
@@ -163,7 +166,13 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     # Use known support for Z to avoid boundary bias/kinks when plotting on full grid.
     a, b = cfg.z_min, cfg.z_max
 
+    # NonLinear1: Default uniform order statistics prior
     results_nonlinear = RJMCMC_Nonlinear(X_train, Z_train, Delta_train, Y_train, a, b, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX, Hcan=20, Kcan=20)
+    
+    # NonLinear2: Dirichlet-Gamma prior for knot locations
+    results_nonlinear_dirichlet = RJMCMC_Nonlinear_Dirichlet(X_train, Z_train, Delta_train, Y_train, a, b, cfg.mcmc_seed + 1000; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX)
+    
+    # CoxPH baseline
     results_coxph = RJMCMC_CoxPH(X_train, Z_train, Delta_train, Y_train, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Hcan=20)
 
     ns = results_nonlinear["ns"]
@@ -171,6 +180,7 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     t_grid = cfg.t_grid
     z_grid = cfg.z_grid
 
+    # ========== NonLinear1 (Default Prior) ==========
     K_all, zetas_all, xis_all = results_nonlinear["K"], results_nonlinear["zetas"], results_nonlinear["xis"]
     H_all, taus_all, gammas_all = results_nonlinear["H"], results_nonlinear["taus"], results_nonlinear["gammas"]
     Tmax = results_nonlinear["Tmax"]
@@ -184,67 +194,84 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     end
     g_pos ./= (ns - bi)
 
-    # Evaluate Λ following notebook approach: only evaluate for t <= Tmax per iteration
-    # Match notebook Cell 7: t_grid_reduced = t_grid[t_grid .<= Tmax]
+    # Evaluate Λ following notebook approach
+    # Key insight: evaluate Lambda on full t_grid, but clamp t values to tau
+    # This produces smooth curves without artificial kinks at Tmax
     Lambda_nonlinear = zeros(length(t_grid))
-    Lambda_nz_nonlinear = zeros(length(t_grid))
     for i in (bi + 1):ns
         H = Int(H_all[i])
         taus = taus_all[1:H, i]
         gammas = gammas_all[1:(H + 2), i]
-        tau_i = Tmax  # Use Tmax as tau for this iteration
-        
-        # Only evaluate for points <= Tmax (matching notebook)
-        valid_mask = t_grid .<= tau_i
-        if any(valid_mask)
-            t_grid_reduced = t_grid[valid_mask]
-            est = Lambda_fun_est(t_grid_reduced, tau_i, taus, gammas)
-            
-            # Pad with zeros if needed (matching notebook logic)
-            if length(est) < length(t_grid)
-                est_full = zeros(length(t_grid))
-                est_full[valid_mask] = est
-            else
-                est_full = est
-            end
-            
-            Lambda_nonlinear .+= est_full
-            Lambda_nz_nonlinear .+= valid_mask
-        end
+        # Lambda_fun_est already clamps t to tau internally, so we can pass full t_grid
+        # This ensures smooth extrapolation beyond Tmax
+        Lambda_nonlinear .+= Lambda_fun_est(t_grid, Tmax, taus, gammas)
     end
-    # Average only over iterations that contributed (matching notebook)
-    Lambda_nonlinear = Lambda_nonlinear ./ max.(Lambda_nz_nonlinear, 1.0)
-    Lambda_nonlinear = accumulate(max, Lambda_nonlinear)
+    Lambda_nonlinear ./= (ns - bi)
 
+    # ========== NonLinear2 (Dirichlet-Gamma Prior) ==========
+    K_all_dir, zetas_all_dir, xis_all_dir = results_nonlinear_dirichlet["K"], results_nonlinear_dirichlet["zetas"], results_nonlinear_dirichlet["xis"]
+    H_all_dir, taus_all_dir, gammas_all_dir = results_nonlinear_dirichlet["H"], results_nonlinear_dirichlet["taus"], results_nonlinear_dirichlet["gammas"]
+    Tmax_dir = results_nonlinear_dirichlet["Tmax"]
+
+    g_pos_dirichlet = zeros(length(z_grid))
+    for i in (bi + 1):ns
+        K = Int(K_all_dir[i])
+        zetas = zetas_all_dir[1:K, i]
+        xis = xis_all_dir[1:(K + 2), i]
+        g_pos_dirichlet .+= g_fun_est(z_grid, a, b, zetas, xis)
+    end
+    g_pos_dirichlet ./= (ns - bi)
+
+    Lambda_nonlinear_dirichlet = zeros(length(t_grid))
+    for i in (bi + 1):ns
+        H = Int(H_all_dir[i])
+        taus = taus_all_dir[1:H, i]
+        gammas = gammas_all_dir[1:(H + 2), i]
+        Lambda_nonlinear_dirichlet .+= Lambda_fun_est(t_grid, Tmax_dir, taus, gammas)
+    end
+    Lambda_nonlinear_dirichlet ./= (ns - bi)
+
+    # ========== CoxPH ==========
     H_cox_all, taus_cox_all, gammas_cox_all = results_coxph["H"], results_coxph["taus"], results_coxph["gammas"]
     Lambda_coxph = zeros(length(t_grid))
     for i in (bi + 1):ns
         H = Int(H_cox_all[i])
         taus = taus_cox_all[1:H, i]
         gammas = gammas_cox_all[1:(H + 2), i]
-        tau_i = Tmax  # Use Tmax as tau for this iteration
-        
-        # Evaluate for all points (CoxPH uses full t_grid in notebook)
-        Lambda_coxph .+= Lambda_fun_est(t_grid, tau_i, taus, gammas)
+        # Lambda_fun_est already clamps t to tau internally
+        Lambda_coxph .+= Lambda_fun_est(t_grid, Tmax, taus, gammas)
     end
     Lambda_coxph ./= (ns - bi)
-    Lambda_coxph = accumulate(max, Lambda_coxph)
 
+    # ========== IBS Calculations ==========
     IBS_coxph = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_coxph, "coxph")
     IBS_nonlinear = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_nonlinear, "nonlinear")
+    IBS_nonlinear_dirichlet = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_nonlinear_dirichlet, "nonlinear")
 
     results_dict = Dict(
+        # CoxPH results
         "beta_coxph" => results_coxph["betas"],
-        "beta_nonlinear" => results_nonlinear["betas"],
         "IBS_coxph" => IBS_coxph,
-        "IBS_nonlinear" => IBS_nonlinear,
         "Lambda_coxph" => Lambda_coxph,
+        "Hseq_coxph" => results_coxph["H"][bi+1:ns],
+        # NonLinear1 (Default Prior) results
+        "beta_nonlinear" => results_nonlinear["betas"],
+        "IBS_nonlinear" => IBS_nonlinear,
         "Lambda_nonlinear" => Lambda_nonlinear,
         "g_nonlinear" => g_pos,
-        "Tmax" => Tmax,
         "Hseq" => results_nonlinear["H"][bi+1:ns],
         "Kseq" => results_nonlinear["K"][bi+1:ns],
-        "Hseq_coxph" => results_coxph["H"][bi+1:ns],
+        # NonLinear2 (Dirichlet-Gamma Prior) results
+        "beta_nonlinear_dirichlet" => results_nonlinear_dirichlet["betas"],
+        "IBS_nonlinear_dirichlet" => IBS_nonlinear_dirichlet,
+        "Lambda_nonlinear_dirichlet" => Lambda_nonlinear_dirichlet,
+        "g_nonlinear_dirichlet" => g_pos_dirichlet,
+        "Hseq_dirichlet" => results_nonlinear_dirichlet["H"][bi+1:ns],
+        "Kseq_dirichlet" => results_nonlinear_dirichlet["K"][bi+1:ns],
+        "alpha_tau_dirichlet" => results_nonlinear_dirichlet["alpha_tau"][bi+1:ns],
+        "alpha_zeta_dirichlet" => results_nonlinear_dirichlet["alpha_zeta"][bi+1:ns],
+        # Common
+        "Tmax" => Tmax,
         "ns" => ns,
         "burn_in" => bi,
         "mode" => string(cfg.mode),
@@ -283,6 +310,7 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
 
     for g_type in cfg.g_types
         for n in cfg.n_values
+            # NonLinear1 (Default Prior) storage
             betas_nonlinear_mat = Float64[]
             betas_se_nonlinear_mat = Float64[]
             betas_nonlinear_mat2 = Float64[]
@@ -292,6 +320,19 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
             cr1_nonlinear = Float64[]
             cr2_nonlinear = Float64[]
 
+            # NonLinear2 (Dirichlet-Gamma Prior) storage
+            betas_nonlinear_dir_mat = Float64[]
+            betas_se_nonlinear_dir_mat = Float64[]
+            betas_nonlinear_dir_mat2 = Float64[]
+            betas_se_nonlinear_dir_mat2 = Float64[]
+            H_nonlinear_dir = Float64[]
+            K_nonlinear_dir = Float64[]
+            cr1_nonlinear_dir = Float64[]
+            cr2_nonlinear_dir = Float64[]
+            alpha_tau_dir = Float64[]
+            alpha_zeta_dir = Float64[]
+
+            # CoxPH storage
             betas_coxph_mat = Float64[]
             betas_se_coxph_mat = Float64[]
             betas_coxph_mat2 = Float64[]
@@ -301,7 +342,9 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
             cr2_coxph = Float64[]
 
             g_samples = Vector{Vector{Float64}}()
+            g_samples_dir = Vector{Vector{Float64}}()
             lambda_non_samples = Vector{Vector{Float64}}()
+            lambda_non_dir_samples = Vector{Vector{Float64}}()
             lambda_cox_samples = Vector{Vector{Float64}}()
 
             for idx in 1:cfg.replications
@@ -318,6 +361,7 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 ns = results_dict["ns"]
                 bi = results_dict["burn_in"]
 
+                # NonLinear1 (Default Prior)
                 push!(betas_nonlinear_mat, mean(results_dict["beta_nonlinear"][1, (bi+1):ns]))
                 push!(betas_se_nonlinear_mat, std(results_dict["beta_nonlinear"][1, (bi+1):ns]))
                 push!(betas_nonlinear_mat2, mean(results_dict["beta_nonlinear"][2, (bi+1):ns]))
@@ -330,13 +374,35 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 cr2 = quantile(results_dict["beta_nonlinear"][2, (bi+1):ns], [0.025, 0.975])
                 push!(cr2_nonlinear, cr2[1] <= 0.5 <= cr2[2])
 
+                push!(g_samples, results_dict["g_nonlinear"])
+                push!(lambda_non_samples, results_dict["Lambda_nonlinear"])
+
+                # NonLinear2 (Dirichlet-Gamma Prior)
+                if haskey(results_dict, "beta_nonlinear_dirichlet")
+                    push!(betas_nonlinear_dir_mat, mean(results_dict["beta_nonlinear_dirichlet"][1, (bi+1):ns]))
+                    push!(betas_se_nonlinear_dir_mat, std(results_dict["beta_nonlinear_dirichlet"][1, (bi+1):ns]))
+                    push!(betas_nonlinear_dir_mat2, mean(results_dict["beta_nonlinear_dirichlet"][2, (bi+1):ns]))
+                    push!(betas_se_nonlinear_dir_mat2, std(results_dict["beta_nonlinear_dirichlet"][2, (bi+1):ns]))
+                    push!(H_nonlinear_dir, mean(results_dict["Hseq_dirichlet"]))
+                    push!(K_nonlinear_dir, mean(results_dict["Kseq_dirichlet"]))
+                    push!(alpha_tau_dir, mean(results_dict["alpha_tau_dirichlet"]))
+                    push!(alpha_zeta_dir, mean(results_dict["alpha_zeta_dirichlet"]))
+
+                    cr1_dir = quantile(results_dict["beta_nonlinear_dirichlet"][1, (bi+1):ns], [0.025, 0.975])
+                    push!(cr1_nonlinear_dir, cr1_dir[1] <= 0.5 <= cr1_dir[2])
+                    cr2_dir = quantile(results_dict["beta_nonlinear_dirichlet"][2, (bi+1):ns], [0.025, 0.975])
+                    push!(cr2_nonlinear_dir, cr2_dir[1] <= 0.5 <= cr2_dir[2])
+
+                    push!(g_samples_dir, results_dict["g_nonlinear_dirichlet"])
+                    push!(lambda_non_dir_samples, results_dict["Lambda_nonlinear_dirichlet"])
+                end
+
+                # CoxPH
                 push!(betas_coxph_mat, mean(results_dict["beta_coxph"][1, (bi+1):ns]))
                 push!(betas_se_coxph_mat, std(results_dict["beta_coxph"][1, (bi+1):ns]))
                 push!(betas_coxph_mat2, mean(results_dict["beta_coxph"][2, (bi+1):ns]))
                 push!(betas_se_coxph_mat2, std(results_dict["beta_coxph"][2, (bi+1):ns]))
                 push!(H_coxph, mean(results_dict["Hseq_coxph"]))
-                push!(g_samples, results_dict["g_nonlinear"])
-                push!(lambda_non_samples, results_dict["Lambda_nonlinear"])
                 push!(lambda_cox_samples, results_dict["Lambda_coxph"])
 
                 cr1c = quantile(results_dict["beta_coxph"][1, (bi+1):ns], [0.025, 0.975])
@@ -344,13 +410,18 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 cr2c = quantile(results_dict["beta_coxph"][2, (bi+1):ns], [0.025, 0.975])
                 push!(cr2_coxph, cr2c[1] <= 0.5 <= cr2c[2])
 
-                push!(df_IBS_summary, (n, g_type, "Nonlinear", results_dict["IBS_nonlinear"]))
+                # IBS entries for all methods
+                push!(df_IBS_summary, (n, g_type, "NonLinear1", results_dict["IBS_nonlinear"]))
                 push!(df_IBS_summary, (n, g_type, "CoxPH", results_dict["IBS_coxph"]))
+                if haskey(results_dict, "IBS_nonlinear_dirichlet")
+                    push!(df_IBS_summary, (n, g_type, "NonLinear2", results_dict["IBS_nonlinear_dirichlet"]))
+                end
             end
 
             if !isempty(betas_nonlinear_mat)
+                # NonLinear1 (Default Prior) summary
                 push!(df_summary, (
-                    g_type, n, "Nonlinear",
+                    g_type, n, "NonLinear1",
                     mean(betas_nonlinear_mat) - 0.5,
                     mean(betas_se_nonlinear_mat),
                     std(betas_nonlinear_mat),
@@ -365,6 +436,26 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                     mean(K_nonlinear),
                 ))
 
+                # NonLinear2 (Dirichlet-Gamma Prior) summary
+                if !isempty(betas_nonlinear_dir_mat)
+                    push!(df_summary, (
+                        g_type, n, "NonLinear2",
+                        mean(betas_nonlinear_dir_mat) - 0.5,
+                        mean(betas_se_nonlinear_dir_mat),
+                        std(betas_nonlinear_dir_mat),
+                        mean(cr1_nonlinear_dir),
+                        mean((betas_nonlinear_dir_mat .- 0.5) .^ 2),
+                        mean(betas_nonlinear_dir_mat2) - 0.5,
+                        mean(betas_se_nonlinear_dir_mat2),
+                        std(betas_nonlinear_dir_mat2),
+                        mean(cr2_nonlinear_dir),
+                        mean((betas_nonlinear_dir_mat2 .- 0.5) .^ 2),
+                        mean(H_nonlinear_dir),
+                        mean(K_nonlinear_dir),
+                    ))
+                end
+
+                # CoxPH summary
                 push!(df_summary, (
                     g_type, n, "CoxPH",
                     mean(betas_coxph_mat) - 0.5,
@@ -387,24 +478,43 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 g_truth = g_true_values(g_type, z_grid)
                 baseline = baseline_cumhaz(t_grid, cfg.hazard_a, cfg.hazard_b)
 
+                # g(z) plot with both NonLinear methods
                 if !isempty(g_samples)
                     g_mat = hcat(g_samples...)
                     g_mean = vec(mean(g_mat, dims=2))
 
-                    plt_g = plot(z_grid, g_truth; lw=2, color=:blue, label="True")
-                    plot!(plt_g, z_grid, g_mean; lw=2, color=:red, label="NonLinear")
+                    # Legend position: topleft for linear, topright for others
+                    legend_pos_g = (g_type == "linear") ? :topleft : :topright
+                    
+                    plt_g = plot(z_grid, g_truth; lw=2, color=:black, label="True", legend=legend_pos_g)
+                    plot!(plt_g, z_grid, g_mean; lw=2, color=:red, linestyle=:dot, label="NonLinear1")
+                    
+                    if !isempty(g_samples_dir)
+                        g_mat_dir = hcat(g_samples_dir...)
+                        g_mean_dir = vec(mean(g_mat_dir, dims=2))
+                        plot!(plt_g, z_grid, g_mean_dir; lw=2, color=:green, linestyle=:dash, label="NonLinear2")
+                    end
+                    
                     xlabel!(plt_g, "z")
                     ylabel!(plt_g, "g(z)")
                     title!(plt_g, "n = $(n)")
                     savefig(plt_g, joinpath(plots_dir, "g_$(g_type)_n$(n).pdf"))
                 end
 
+                # Λ(t) plot with both NonLinear methods
                 if !isempty(lambda_non_samples)
                     lam_non_mat = hcat(lambda_non_samples...)
                     lam_non_mean = vec(mean(lam_non_mat, dims=2))
 
-                    plt_lam = plot(t_grid, baseline; lw=2, color=:blue, label="True")
-                    plot!(plt_lam, t_grid, lam_non_mean; lw=2, color=:red, label="NonLinear")
+                    plt_lam = plot(t_grid, baseline; lw=2, color=:black, label="True", legend=:topleft)
+                    plot!(plt_lam, t_grid, lam_non_mean; lw=2, color=:red, linestyle=:dot, label="NonLinear1")
+                    
+                    if !isempty(lambda_non_dir_samples)
+                        lam_non_dir_mat = hcat(lambda_non_dir_samples...)
+                        lam_non_dir_mean = vec(mean(lam_non_dir_mat, dims=2))
+                        plot!(plt_lam, t_grid, lam_non_dir_mean; lw=2, color=:green, linestyle=:dash, label="NonLinear2")
+                    end
+                    
                     xlabel!(plt_lam, "t")
                     ylabel!(plt_lam, "Λ(t)")
                     title!(plt_lam, "n = $(n)")
@@ -420,6 +530,7 @@ end
 
 # -------------------------------------------------------------------------
 # Manuscript-style plots (Figures 1-4) with CoxPH comparisons
+# Compares: CoxPH, NonLinear1 (Default Prior), NonLinear2 (Dirichlet-Gamma Prior)
 # -------------------------------------------------------------------------
 function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
     plot_dir = joinpath(base_dir, "plots_manuscript")
@@ -428,16 +539,20 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
     baseline = baseline_cumhaz(cfg.t_grid, cfg.hazard_a, cfg.hazard_b)
     ibs_rows = DataFrame(g_type=String[], n=Int[], Method=String[], IBS=Float64[])
 
-    # Cache means per (g, n)
-    lam_non_means = Dict{Tuple{String,Int}, Vector{Float64}}()
+    # Cache means per (g, n) for all methods
+    lam_non1_means = Dict{Tuple{String,Int}, Vector{Float64}}()  # NonLinear1 (Default)
+    lam_non2_means = Dict{Tuple{String,Int}, Vector{Float64}}()  # NonLinear2 (Dirichlet)
     lam_cox_means = Dict{Tuple{String,Int}, Union{Vector{Float64},Nothing}}()
-    g_non_means = Dict{Tuple{String,Int}, Vector{Float64}}()
+    g_non1_means = Dict{Tuple{String,Int}, Vector{Float64}}()    # NonLinear1 (Default)
+    g_non2_means = Dict{Tuple{String,Int}, Vector{Float64}}()    # NonLinear2 (Dirichlet)
 
     for g_type in cfg.g_types
         for n in cfg.n_values
-            lam_non_list = Vector{Vector{Float64}}()
+            lam_non1_list = Vector{Vector{Float64}}()
+            lam_non2_list = Vector{Vector{Float64}}()
             lam_cox_list = Vector{Vector{Float64}}()
-            g_non_list = Vector{Vector{Float64}}()
+            g_non1_list = Vector{Vector{Float64}}()
+            g_non2_list = Vector{Vector{Float64}}()
 
             # Collect only existing replications (use max up to cfg.replications but skip missing)
             found_any = false
@@ -451,13 +566,29 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                 data = deserialize(file)
                 close(file)
 
-                push!(lam_non_list, data["Lambda_nonlinear"])
-                push!(g_non_list, data["g_nonlinear"])
+                # NonLinear1 (Default Prior)
+                push!(lam_non1_list, data["Lambda_nonlinear"])
+                push!(g_non1_list, data["g_nonlinear"])
+                
+                # NonLinear2 (Dirichlet-Gamma Prior)
+                if haskey(data, "Lambda_nonlinear_dirichlet")
+                    push!(lam_non2_list, data["Lambda_nonlinear_dirichlet"])
+                end
+                if haskey(data, "g_nonlinear_dirichlet")
+                    push!(g_non2_list, data["g_nonlinear_dirichlet"])
+                end
+                
+                # CoxPH
                 if haskey(data, "Lambda_coxph")
                     push!(lam_cox_list, data["Lambda_coxph"])
                 end
+                
+                # IBS for all methods
                 if haskey(data, "IBS_nonlinear")
-                    push!(ibs_rows, (g_type, n, "NonLinear", data["IBS_nonlinear"]))
+                    push!(ibs_rows, (g_type, n, "NonLinear1", data["IBS_nonlinear"]))
+                end
+                if haskey(data, "IBS_nonlinear_dirichlet")
+                    push!(ibs_rows, (g_type, n, "NonLinear2", data["IBS_nonlinear_dirichlet"]))
                 end
                 if haskey(data, "IBS_coxph")
                     push!(ibs_rows, (g_type, n, "CoxPH", data["IBS_coxph"]))
@@ -469,16 +600,27 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                 continue
             end
 
-            if !isempty(lam_non_list)
-                lam_non_means[(g_type, n)] = vec(mean(hcat(lam_non_list...), dims=2))
+            # Store means for NonLinear1
+            if !isempty(lam_non1_list)
+                lam_non1_means[(g_type, n)] = vec(mean(hcat(lam_non1_list...), dims=2))
             end
+            if !isempty(g_non1_list)
+                g_non1_means[(g_type, n)] = vec(mean(hcat(g_non1_list...), dims=2))
+            end
+            
+            # Store means for NonLinear2
+            if !isempty(lam_non2_list)
+                lam_non2_means[(g_type, n)] = vec(mean(hcat(lam_non2_list...), dims=2))
+            end
+            if !isempty(g_non2_list)
+                g_non2_means[(g_type, n)] = vec(mean(hcat(g_non2_list...), dims=2))
+            end
+            
+            # Store means for CoxPH
             if !isempty(lam_cox_list)
                 lam_cox_means[(g_type, n)] = vec(mean(hcat(lam_cox_list...), dims=2))
             else
                 lam_cox_means[(g_type, n)] = nothing
-            end
-            if !isempty(g_non_list)
-                g_non_means[(g_type, n)] = vec(mean(hcat(g_non_list...), dims=2))
             end
         end
     end
@@ -486,22 +628,55 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
     # Figures for each g_type
     for g_type in cfg.g_types
         # Collect available n values for this g_type
-        available_n_lam = [n for n in cfg.n_values if haskey(lam_non_means, (g_type, n))]
-        available_n_g = [n for n in cfg.n_values if haskey(g_non_means, (g_type, n))]
+        available_n_lam = [n for n in cfg.n_values if haskey(lam_non1_means, (g_type, n))]
+        available_n_g = [n for n in cfg.n_values if haskey(g_non1_means, (g_type, n))]
         
-        # Λ panels - only plot available n values
+        # Λ panels - compare NonLinear1 and NonLinear2
         if !isempty(available_n_lam)
             n_lam_count = length(available_n_lam)
             lam_layout = (1, n_lam_count)
-            p_lam = plot(layout=lam_layout, size=(400 * n_lam_count, 400), legend=:topright)
+            p_lam = plot(layout=lam_layout, size=(600 * n_lam_count, 400), legend=true)
             for (i, n) in enumerate(available_n_lam)
-                lam_non = lam_non_means[(g_type, n)]
-                plt = plot(cfg.t_grid, baseline; color=:black, lw=2, label=i == 1 ? "True" : "", legend=:topright)
-                plot!(plt, cfg.t_grid, lam_non; color=:red, lw=2, label=i == 1 ? "NonLinear" : "", linestyle=:dash)
-                title!(plt, "n = $(n)")
-                xlabel!(plt, "t")
-                ylabel!(plt, "Λ(t)")
-                plot!(p_lam, plt, subplot=i)
+                lam_non1 = lam_non1_means[(g_type, n)]
+                # Handle NaN values
+                lam_non1_clean = [isnan(x) ? missing : x for x in lam_non1]
+                lam_non1_avg = [ismissing(x) ? 0.0 : x for x in lam_non1_clean]
+                
+                # Check if NonLinear2 data exists
+                has_non2 = haskey(lam_non2_means, (g_type, n))
+                
+                if has_non2
+                    lam_non2 = lam_non2_means[(g_type, n)]
+                    lam_non2_clean = [isnan(x) ? missing : x for x in lam_non2]
+                    lam_non2_avg = [ismissing(x) ? 0.0 : x for x in lam_non2_clean]
+                end
+                
+                if i == 1
+                    plot!(p_lam[i], cfg.t_grid, baseline,
+                          xlabel=L"$t$", ylabel=L"$\Lambda(t)$", margin=10Plots.mm,
+                          label="True", color=:black, lw=2, title="n = $(n)", 
+                          xlim=(0, 2.5), ylim=(0, 5),
+                          tickfontsize=12,
+                          xguidefontsize=14,
+                          yguidefontsize=14,
+                          legend=:topleft)
+                    plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
+                    if has_non2
+                        plot!(p_lam[i], cfg.t_grid, lam_non2_avg, label="NonLinear2", color=:green, lw=2, linestyle=:dash)
+                    end
+                else
+                    plot!(p_lam[i], cfg.t_grid, baseline,
+                          xlabel=L"$t$", ylabel=L"$\Lambda(t)$", margin=10Plots.mm,
+                          label="", color=:black, lw=2, title="n = $(n)",
+                          xlim=(0, 2.5), ylim=(0, 5),
+                          tickfontsize=12,
+                          xguidefontsize=14,
+                          yguidefontsize=14)
+                    plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
+                    if has_non2
+                        plot!(p_lam[i], cfg.t_grid, lam_non2_avg, label="", color=:green, lw=2, linestyle=:dash)
+                    end
+                end
             end
             savefig(p_lam, joinpath(plot_dir, "Lambda_$(g_type).pdf"))
             println("Generated Lambda plot for g=$(g_type) with $(n_lam_count) sample size(s): $(available_n_lam)")
@@ -509,20 +684,54 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
             @warn "No Lambda data available for g=$(g_type); skipping plot."
         end
 
-        # g(z) panels (only NonLinear estimated) - only plot available n values
+        # g(z) panels - compare NonLinear1 and NonLinear2
         if !isempty(available_n_g)
             n_g_count = length(available_n_g)
             g_layout = (1, n_g_count)
-            p_g = plot(layout=g_layout, size=(400 * n_g_count, 400), legend=:topright)
+            p_g = plot(layout=g_layout, size=(600 * n_g_count, 400), legend=true)
             g_true = g_true_values(g_type, cfg.z_grid)
             for (i, n) in enumerate(available_n_g)
-                g_non = g_non_means[(g_type, n)]
-                plt = plot(cfg.z_grid, g_true; color=:black, lw=2, label=i == 1 ? "True" : "", legend=:topright)
-                plot!(plt, cfg.z_grid, g_non; color=:red, lw=2, label=i == 1 ? "NonLinear" : "", linestyle=:dash)
-                title!(plt, "n = $(n)")
-                xlabel!(plt, "z")
-                ylabel!(plt, "g(z)")
-                plot!(p_g, plt, subplot=i)
+                g_non1 = g_non1_means[(g_type, n)]
+                # Handle NaN values
+                g_non1_clean = [isnan(x) ? missing : x for x in g_non1]
+                g_non1_avg = [ismissing(x) ? 0.0 : x for x in g_non1_clean]
+                
+                # Check if NonLinear2 data exists
+                has_non2 = haskey(g_non2_means, (g_type, n))
+                
+                if has_non2
+                    g_non2 = g_non2_means[(g_type, n)]
+                    g_non2_clean = [isnan(x) ? missing : x for x in g_non2]
+                    g_non2_avg = [ismissing(x) ? 0.0 : x for x in g_non2_clean]
+                end
+                
+                # Legend position: topleft for linear, topright for others
+                legend_pos_g = (g_type == "linear") ? :topleft : :topright
+                
+                if i == 1
+                    plot!(p_g[i], cfg.z_grid, g_true,
+                          xlabel=L"$z$", ylabel=L"$g(z)$", margin=10Plots.mm,
+                          label="True", color=:black, lw=2, title="n = $(n)",
+                          tickfontsize=12,
+                          xguidefontsize=14,
+                          yguidefontsize=14,
+                          legend=legend_pos_g)
+                    plot!(p_g[i], cfg.z_grid, g_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
+                    if has_non2
+                        plot!(p_g[i], cfg.z_grid, g_non2_avg, label="NonLinear2", color=:green, lw=2, linestyle=:dash)
+                    end
+                else
+                    plot!(p_g[i], cfg.z_grid, g_true,
+                          xlabel=L"$z$", ylabel=L"$g(z)$", margin=10Plots.mm,
+                          label="", color=:black, lw=2, title="n = $(n)",
+                          tickfontsize=12,
+                          xguidefontsize=14,
+                          yguidefontsize=14)
+                    plot!(p_g[i], cfg.z_grid, g_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
+                    if has_non2
+                        plot!(p_g[i], cfg.z_grid, g_non2_avg, label="", color=:green, lw=2, linestyle=:dash)
+                    end
+                end
             end
             savefig(p_g, joinpath(plot_dir, "g_$(g_type).pdf"))
             println("Generated g(z) plot for g=$(g_type) with $(n_g_count) sample size(s): $(available_n_g)")
@@ -531,35 +740,35 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
         end
     end
 
-    # IBS boxplot (Figure 4 style) - only plot g_types with data
-    if !isempty(ibs_rows)
-        df_ibs = ibs_rows
-        df_ibs.n_str = string.(df_ibs.n)
-        df_ibs.Method = categorical(df_ibs.Method, ordered=true, levels=["CoxPH", "NonLinear"])
-        
-        # Collect g_types that have IBS data
-        available_g_types_ibs = unique(df_ibs.g_type)
-        if !isempty(available_g_types_ibs)
-            n_g_types = length(available_g_types_ibs)
-            p_ibs = plot(layout=(1, n_g_types), size=(600 * n_g_types, 500), legend=:topright)
-            colors = [:pink, :teal]
-            for (i, g_type) in enumerate(available_g_types_ibs)
-                subdf = df_ibs[df_ibs.g_type .== g_type, :]
-                if nrow(subdf) > 0
-                    plt = @df subdf boxplot(:n_str, :IBS, group=:Method, legend=i == 1 ? :topright : false, palette=colors)
-                    title!(plt, string(uppercasefirst(g_type)))
-                    xlabel!(plt, "n")
-                    ylabel!(plt, "IBS")
-                    plot!(p_ibs, plt, subplot=i)
+    # IBS boxplot using R script (Figure 4 style)
+    # Use the df_IBS.csv file generated by summarize_tasks
+    ibs_csv_path = joinpath(base_dir, "df_IBS.csv")
+    ibs_pdf_path = joinpath(plot_dir, "IBS_boxplots.pdf")
+    
+    if isfile(ibs_csv_path)
+        # Call R script to generate IBS boxplot
+        r_script_path = joinpath(@__DIR__, "boxplot.R")
+        if isfile(r_script_path)
+            try
+                # Ensure output directory exists
+                mkpath(dirname(ibs_pdf_path))
+                run(`Rscript $r_script_path $ibs_csv_path $ibs_pdf_path`)
+                if isfile(ibs_pdf_path)
+                    println("Generated IBS boxplot using R script: $(ibs_pdf_path)")
+                else
+                    @warn "R script completed but output file not found: $(ibs_pdf_path)"
                 end
+            catch e
+                @warn "Failed to generate IBS boxplot using R script: $e"
+                @warn "Make sure R and ggplot2 package are installed."
+                @warn "You can install ggplot2 in R with: install.packages('ggplot2')"
             end
-            savefig(p_ibs, joinpath(plot_dir, "IBS_boxplots.pdf"))
-            println("Generated IBS boxplot with $(n_g_types) g_type(s): $(available_g_types_ibs)")
         else
-            @warn "No IBS data available for plotting."
+            @warn "R script not found at $(r_script_path); skipping IBS boxplot generation."
         end
     else
-        @warn "IBS table empty; rerun simulations to populate IBS metrics."
+        @warn "IBS CSV file not found at $(ibs_csv_path); skipping IBS boxplot generation."
+        @warn "Run summarize_tasks first to generate df_IBS.csv"
     end
 end
 
@@ -626,7 +835,17 @@ function main()
     end
 
     n_active_threads = min(cfg.n_workers, nthreads())
-    println("Running simulations with $n_active_threads threads (set JULIA_NUM_THREADS to change).")
+    
+    # Warn if user requested more workers than available threads
+    if cfg.n_workers > nthreads()
+        println("⚠️  Warning: Requested $(cfg.n_workers) workers but Julia was started with only $(nthreads()) thread(s).")
+        println("   To use more threads, restart Julia with: JULIA_NUM_THREADS=$(cfg.n_workers) julia simulation.jl ...")
+        println("   Or on Windows PowerShell: \$env:JULIA_NUM_THREADS=$(cfg.n_workers); julia simulation.jl ...")
+        println("   Proceeding with $(n_active_threads) thread(s)...")
+        println()
+    end
+    
+    println("Running simulations with $n_active_threads threads.")
     prog = Progress(length(tasks); desc="Simulations")
     progress_lock = ReentrantLock()
     limit = max(1, min(cfg.n_workers, nthreads()))

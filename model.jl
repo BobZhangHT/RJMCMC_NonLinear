@@ -8,8 +8,10 @@ using Statistics
 using ProgressMeter
 using VectorizedStatistics
 using StatsBase
+using SpecialFunctions  # For loggamma in Dirichlet prior
 
 export RJMCMC_Nonlinear,
+       RJMCMC_Nonlinear_Dirichlet,
        RJMCMC_CoxPH,
        St_pred,
        coxph_St_pred,
@@ -814,6 +816,644 @@ function RJMCMC_Nonlinear(
         "b"=> b,
         "ns" => NS,
         "burn_in" => BI
+    )
+
+    return results
+end
+
+##################################################################################################################
+# RJMCMC with Dirichlet-Gamma Prior for Knot Locations
+# Based on Supplementary Material: Dirichlet Priors for Knot Locations
+##################################################################################################################
+
+# Compute log Dirichlet prior for knot locations
+function log_dirichlet_prior_tau(taus_, alpha_tau, tau)
+    H = length(taus_) - 2  # taus_ includes 0 and tau as boundaries
+    if H < 0
+        return 0.0
+    end
+    # Compute interval lengths
+    deltas = diff(taus_)
+    # Log prior: log Γ((H+1)α) - (H+1)log Γ(α) + (α-1) * Σ log(Δ_h)
+    log_prior = loggamma((H+1) * alpha_tau) - (H+1) * loggamma(alpha_tau) + (alpha_tau - 1) * sum(log.(deltas))
+    return log_prior
+end
+
+function log_dirichlet_prior_zeta(zetas_, alpha_zeta, a, b)
+    K = length(zetas_) - 2  # zetas_ includes a and b as boundaries
+    if K < 0
+        return 0.0
+    end
+    # Compute interval lengths
+    deltas = diff(zetas_)
+    # Log prior: log Γ((K+1)α) - (K+1)log Γ(α) + (α-1) * Σ log(Δ_k)
+    log_prior = loggamma((K+1) * alpha_zeta) - (K+1) * loggamma(alpha_zeta) + (alpha_zeta - 1) * sum(log.(deltas))
+    return log_prior
+end
+
+# Reversible-jump sampler with Dirichlet-Gamma prior for knot locations
+function RJMCMC_Nonlinear_Dirichlet(
+        X, Z, Delta, Y, a, b,
+        random_seed;
+        ns::Int=DEFAULT_NS,
+        burn_in::Int=DEFAULT_BURN_IN,
+        RJMCMC_indicator::Bool=true,
+        Adapt_C::Bool=true,
+        Hmax::Int=DEFAULT_HMAX,
+        Kmax::Int=DEFAULT_KMAX,
+        # Dirichlet-Gamma hyperparameters
+        a_tau::Float64=1.0,    # Gamma shape for alpha_tau
+        b_tau::Float64=1.0,    # Gamma rate for alpha_tau
+        a_zeta::Float64=1.0,   # Gamma shape for alpha_zeta
+        b_zeta::Float64=1.0    # Gamma rate for alpha_zeta
+     )
+
+    NS = ns
+    BI = burn_in
+    # ---------------------------- Hyper-Parameters ----------------------------
+    dim_beta = size(X,2)
+    
+    # obtain the observed time
+    obs_time = (Y .* Delta) 
+    obs_time = obs_time[obs_time .> 0]
+    tau  = maximum(obs_time)
+    
+    # prior parameter for number of knots (Poisson mean)
+    mu_H = mu_K = 1
+
+    # initial H and K
+    H = 0
+    K = 0
+    
+    # Initial Dirichlet concentration parameters (sampled from Gamma prior)
+    alpha_tau = rand(Gamma(a_tau, 1/b_tau))
+    alpha_zeta = rand(Gamma(a_zeta, 1/b_zeta))
+    
+    # coefficients for MH proposals
+    c_gamma = 1
+    c_xi = 1
+    c_beta = 1
+    c_cnt = 0
+    c_alpha = 0.5  # for alpha updates
+    AHigh = 0.4
+    ALow = 0.2
+    
+    n_report = 250
+    
+    # birth probability
+    r_HB = 0.5
+    r_KB = 0.5
+    
+    # ---------------------------- Storage Variables ----------------------------
+    betas_all = zeros(dim_beta, NS)
+    
+    H_all = zeros(NS)
+    taus_all = zeros(Hmax, NS)
+    gammas_all = zeros(Hmax+2, NS)
+    
+    K_all = zeros(NS)
+    zetas_all = zeros(Kmax, NS)
+    xis_all = zeros(Kmax+2, NS)
+    
+    sigmas_gamma_all = zeros(NS)
+    sigmas_xi_all = zeros(NS)
+    
+    # Store Dirichlet concentration parameters
+    alpha_tau_all = zeros(NS)
+    alpha_zeta_all = zeros(NS)
+    
+    # Acceptance variables
+    abetas_all = zeros(dim_beta, NS)
+    aH_all = zeros(NS)
+    agammas_all = zeros(Hmax+2, NS)
+    aK_all = zeros(NS)
+    axis_all = zeros(Kmax+2, NS)
+    
+    # ------------------ Prior Specification ------------------ 
+    Random.seed!(random_seed)
+    
+    # Initialize taus (empty for H=0)
+    taus = Float64[]
+    taus_ = [0.0; taus; tau]
+    
+    gammas = zeros(H+2)
+    gammas[1] = rand(Normal(0,5))
+    for i in 2:(H+2)
+        gammas[i] = rand(Normal(gammas[i-1],1))
+    end  
+    
+    # Initialize zetas (empty for K=0)
+    zetas = Float64[]
+    zetas_ = [a; zetas; b]
+    
+    xis = zeros(K+2)
+    xis[1] = 0
+    for i in 2:(K+2)
+        xis[i] = rand(Normal(xis[i-1],1))
+    end
+    
+    betas = zeros(dim_beta)
+    
+    # Store initial values
+    H_all[1] = H
+    gammas_all[1:(H+2),1] = gammas
+    K_all[1] = K
+    xis_all[1:(K+2),1] = xis
+    betas_all[:,1] = betas
+    sigmas_gamma_all[1] = 1
+    sigmas_xi_all[1] = 1
+    alpha_tau_all[1] = alpha_tau
+    alpha_zeta_all[1] = alpha_zeta
+    
+    aH_all[1] = 1
+    agammas_all[1:(H+2),1] .= 1
+    aK_all[1] = 1
+    axis_all[1:(K+2),1] .= 1
+    abetas_all[:,1] .= 1
+
+    Random.seed!(random_seed)
+
+    # ---------------------------- MCMC Loop ----------------------------
+    @time @showprogress for iter in 2:NS
+
+        # ----------------------------- Update Gamma ----------------------------- 
+        gammas_star = copy(gammas)
+        agamma_vec = zeros(size(gammas)[1])
+        sigma_gamma = sigmas_gamma_all[iter-1]
+        
+        for h in 1:(H+2)        
+            log_prob_de = log(pdf(Normal(0,5), gammas_star[1]))
+            for hh in 2:(H+2)
+                log_prob_de += log(pdf(Normal(gammas_star[hh-1], sigma_gamma), gammas_star[hh]))
+            end
+            log_de = log_prob_de + loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas_star, a,b,zetas,xis)
+            
+            gammas_star[h] = rand(Uniform(gammas[h]-c_gamma, gammas[h]+c_gamma))
+            
+            log_prob_num = log(pdf(Normal(0,5), gammas_star[1]))                        
+            for hh in 2:(H+2)
+                log_prob_num += log(pdf(Normal(gammas_star[hh-1], sigma_gamma), gammas_star[hh]))
+            end
+            log_num = log_prob_num + loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas_star, a,b,zetas,xis)
+            
+            aratio = exp(log_num - log_de)
+            acc_prob = min(1, aratio)
+            agamma_vec[h] = acc = rand() < acc_prob
+            gammas_star[h] = acc * gammas_star[h] + (1-acc) * gammas[h]
+        end
+        
+        agammas_all[1:(H+2),iter] = agamma_vec
+        
+        # ----------------------------- Update Sigma_Gamma -----------------------------
+        shape_param = 0.5 * H + 0.5
+        scale_param = 0.5 * sum(diff(gammas_star).^2)
+        sigma_gamma_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
+        sigmas_gamma_all[iter] = sigma_gamma_star
+        
+        # ----------------------------- Update Tau (with Dirichlet prior) -----------------------------
+        taus_ = [0.0; taus; tau]
+        taus_star = copy(taus_)
+        taus_star_replace = copy(taus_)
+                
+        if H > 0
+            hc = rand(1:H)
+            tau_hc_star = rand(Uniform(taus_star[hc], taus_star[hc+2]))
+            taus_star_replace[hc+1] = tau_hc_star
+            
+            # Log-likelihood ratio
+            log_lik_de = loglkh_cal(X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis)
+            log_lik_num = loglkh_cal(X,Z,Delta,Y, betas, tau, taus_star_replace[2:(H+1)], gammas_star, a,b,zetas,xis)
+            
+            # Dirichlet prior ratio (Eq. 3 in supplement)
+            log_prior_de = (alpha_tau - 1) * (log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc]))
+            log_prior_num = (alpha_tau - 1) * (log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc]))
+            
+            log_ratio = (log_lik_num - log_lik_de) + (log_prior_num - log_prior_de)
+            
+            aratio = exp(log_ratio)
+            acc_prob = min(1, aratio)
+            acc = rand() < acc_prob
+            taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1]
+        end
+        
+        # ----------------------------- RJMCMC for H (with Dirichlet prior) -----------------------------
+        if H == 0
+            r_HB_star = 1
+            H_star = H + 1
+        elseif H == Hmax
+            r_HB_star = 0
+            H_star = H - 1
+        else
+            r_HB_star = r_HB
+            H_star = H + 2*Int(rand(Bernoulli(0.5))) - 1
+        end
+       
+        if RJMCMC_indicator
+            if H_star > H
+                # ------------ Birth Move (Eq. 4 in supplement) ------------
+                tau_star_new = rand(Uniform(0, tau))
+                taus_star_add = sort([taus_star; tau_star_new])
+                
+                h = sum(taus_star .< tau_star_new)
+                Ah = (gammas_star[h+1] - gammas_star[h]) / (taus_star[h+1] - taus_star[h])
+                U = rand()
+                gamma_star = gammas_star[h] + (tau_star_new - taus_star[h]) * (Ah - (taus_star[h+1] - tau_star_new) / (taus_star[h+1] - taus_star[h]) * log((1-U)/U))
+                gammas_star_add = [gammas_star[1:h]; gamma_star; gammas_star[(h+1):(H_star+1)]]
+                
+                # Dirichlet prior ratio for birth (Eq. 4)
+                Delta_j_old = taus_star[h+1] - taus_star[h]
+                Delta_j_new = tau_star_new - taus_star[h]
+                Delta_jp1_new = taus_star[h+1] - tau_star_new
+                
+                log_prior_ratio = loggamma((H+2) * alpha_tau) - loggamma((H+1) * alpha_tau) - loggamma(alpha_tau) +
+                                  (alpha_tau - 1) * (log(Delta_j_new) + log(Delta_jp1_new) - log(Delta_j_old))
+                
+                log_a_BM = loglkh_cal(X,Z,Delta,Y, betas, tau, taus_star_add[2:(H_star+1)], gammas_star_add, a,b,zetas,xis) - 
+                           loglkh_cal(X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis) +
+                           log_prior_ratio +
+                           log(pdf(Normal(gammas_star[h], sigma_gamma_star), gamma_star)) +
+                           log(pdf(Normal(gamma_star, sigma_gamma_star), gammas_star[h+1])) -
+                           log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
+                           log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
+                
+                acc_BM_prob = min(1, exp(log_a_BM))
+                acc_MHM = rand() < acc_BM_prob
+                
+                if acc_MHM
+                    H_all[iter] = H_star
+                    aH_all[iter] = 1
+                    taus_all[1:H_star,iter] = taus_star_add[2:(H_star+1)]
+                    gammas_all[1:(H_star+2),iter] = gammas_star_add
+                    H = H_star
+                    taus = taus_star_add[2:(H_star+1)]
+                    gammas = gammas_star_add
+                    sigma_gamma = sigma_gamma_star
+                else
+                    H_all[iter] = H
+                    aH_all[iter] = 0
+                    taus_all[1:H,iter] = taus_star[2:(H+1)]
+                    gammas_all[1:(H+2),iter] = gammas_star
+                    taus = taus_star[2:(H+1)]
+                    gammas = gammas_star
+                    sigma_gamma = sigma_gamma_star
+                end
+                    
+            else 
+                # ------------ Death Move (Eq. 5 in supplement) ------------
+                h = rand(1:H)
+                taus_star_rm = deleteat!(copy(taus_star), h+1)
+                gammas_star_rm = deleteat!(copy(gammas_star), h+1)
+
+                A_hp1 = (gammas_star[h+2]-gammas_star[h+1])/(taus_star[h+2]-taus_star[h+1])
+                A_h = (gammas_star[h+1]-gammas_star[h])/(taus_star[h+1]-taus_star[h])
+                U = exp(A_h)/(exp(A_h)+exp(A_hp1))
+                
+                # Dirichlet prior ratio for death (Eq. 5)
+                Delta_j_old = taus_star[h+1] - taus_star[h]
+                Delta_jp1_old = taus_star[h+2] - taus_star[h+1]
+                Delta_j_new = taus_star_rm[h+1] - taus_star_rm[h]
+                
+                log_prior_ratio = loggamma(H * alpha_tau) + loggamma(alpha_tau) - loggamma((H+1) * alpha_tau) +
+                                  (alpha_tau - 1) * (log(Delta_j_new) - log(Delta_j_old) - log(Delta_jp1_old))
+                
+                log_a_DM = loglkh_cal(X,Z,Delta,Y, betas, tau, taus_star_rm[2:(H_star+1)], gammas_star_rm, a,b,zetas,xis) - 
+                           loglkh_cal(X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis) +
+                           log_prior_ratio +
+                           log(pdf(Normal(gammas_star_rm[h], sigma_gamma_star), gammas_star_rm[h+1])) - 
+                           log(pdf(Normal(gammas_star[h+1], sigma_gamma_star), gammas_star[h+2])) -
+                           log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
+                           log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
+        
+                acc_DM_prob = min(1, exp(log_a_DM))
+                acc_MHM = rand() < acc_DM_prob
+            
+                if acc_MHM
+                    H_all[iter] = H_star
+                    aH_all[iter] = 1
+                    taus_all[1:H_star,iter] = taus_star_rm[2:(H_star+1)]
+                    gammas_all[1:(H_star+2),iter] = gammas_star_rm
+                    H = H_star
+                    taus = taus_star_rm[2:(H_star+1)]
+                    gammas = gammas_star_rm
+                    sigma_gamma = sigma_gamma_star
+                else
+                    H_all[iter] = H
+                    aH_all[iter] = 0
+                    taus_all[1:H,iter] = taus_star[2:(H+1)]
+                    gammas_all[1:(H+2),iter] = gammas_star
+                    taus = taus_star[2:(H+1)]
+                    gammas = gammas_star
+                    sigma_gamma = sigma_gamma_star
+                end
+            end
+        else
+            H_all[iter] = H
+            aH_all[iter] = 0
+            taus_all[1:H,iter] = taus_star[2:(H+1)]
+            gammas_all[1:(H+2),iter] = gammas_star
+            taus = taus_star[2:(H+1)]
+            gammas = gammas_star
+            sigma_gamma = sigma_gamma_star
+        end
+    
+        # ----------------------------- Update Beta -----------------------------
+        betas_star = copy(betas)
+        abeta_vec = zeros(size(betas)[1])
+        
+        for j in 1:dim_beta
+            log_de = loglkh_cal(X,Z,Delta,Y, betas_star, tau, taus, gammas, a,b,zetas,xis)
+            betas_star[j] = rand(Uniform(betas[j]-c_beta, betas[j]+c_beta))
+            log_num = loglkh_cal(X,Z,Delta,Y, betas_star, tau, taus, gammas, a,b,zetas,xis)
+            
+            aratio = exp(log_num - log_de)
+            acc_prob = min(1, aratio)
+            abeta_vec[j] = acc = rand() < acc_prob
+            betas_star[j] = acc * betas_star[j] + (1-acc) * betas[j]
+        end
+        
+        betas_all[:,iter] = betas_star
+        abetas_all[:,iter] = abeta_vec
+        betas = betas_star
+    
+        # ----------------------------- Update Xi ----------------------------- 
+        xis_star = copy(xis)
+        axi_vec = zeros(size(xis)[1])
+        sigma_xi = sigmas_xi_all[iter-1]
+    
+        for k in 2:(K+2)        
+            log_prob_de = 0 
+            for kk in 2:(K+2)
+                log_prob_de += log(pdf(Normal(xis_star[kk-1], sigma_xi), xis_star[kk]))
+            end
+            log_de = log_prob_de + loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas, a,b,zetas,xis_star)
+            
+            xis_star[k] = rand(Uniform(xis[k]-c_xi, xis[k]+c_xi))        
+            log_prob_num = 0
+            for kk in 2:(K+2)
+                log_prob_num += log(pdf(Normal(xis_star[kk-1], sigma_xi), xis_star[kk]))
+            end
+            log_num = log_prob_num + loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas, a,b,zetas,xis_star)
+            
+            aratio = exp(log_num - log_de)
+            acc_prob = min(1, aratio)
+            axi_vec[k] = acc = rand() < acc_prob
+            xis_star[k] = acc * xis_star[k] + (1-acc) * xis[k]
+        end
+        
+        axis_all[1:(K+2),iter] = axi_vec
+        
+        # ----------------------------- Update Sigma_Xi -----------------------------
+        shape_param = 0.5 * K + 0.5
+        scale_param = 0.5 * sum(diff(xis_star).^2)
+        sigma_xi_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
+        sigmas_xi_all[iter] = sigma_xi_star
+        
+        # ----------------------------- Update Zeta (with Dirichlet prior) -----------------------------
+        zetas_ = [a; zetas; b]
+        zetas_star = copy(zetas_)
+        zetas_star_replace = copy(zetas_)
+		
+        if K > 0
+            kc = rand(1:K)
+            zeta_kc_star = rand(Uniform(zetas_star[kc], zetas_star[kc+2]))
+            zetas_star_replace[kc+1] = zeta_kc_star
+            
+            # Log-likelihood ratio
+            log_lik_de = loglkh_cal(X,Z,Delta,Y, betas, tau, taus, gammas, a,b, zetas_star[2:(K+1)], xis_star)
+            log_lik_num = loglkh_cal(X,Z,Delta,Y, betas, tau, taus, gammas, a,b, zetas_star_replace[2:(K+1)], xis_star)
+            
+            # Dirichlet prior ratio
+            log_prior_de = (alpha_zeta - 1) * (log(zetas_star[kc+2] - zetas_star[kc+1]) + log(zetas_star[kc+1] - zetas_star[kc]))
+            log_prior_num = (alpha_zeta - 1) * (log(zetas_star[kc+2] - zeta_kc_star) + log(zeta_kc_star - zetas_star[kc]))
+            
+            log_ratio = (log_lik_num - log_lik_de) + (log_prior_num - log_prior_de)
+            
+            aratio = exp(log_ratio)
+            acc_prob = min(1, aratio)
+            acc = rand() < acc_prob
+            zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1]
+        end
+    
+        # ----------------------------- RJMCMC for K (with Dirichlet prior) -----------------------------
+        if K == 0
+            r_KB_star = 1
+            K_star = K + 1
+        elseif K == Kmax
+            r_KB_star = 0
+            K_star = K - 1
+        else
+            r_KB_star = r_KB
+            K_star = K + 2*Int(rand(Bernoulli(0.5))) - 1
+        end
+    
+        if RJMCMC_indicator
+            if K_star > K
+                # ------------ Birth Move for zeta ------------
+                zeta_star_new = rand(Uniform(a, b))
+                zetas_star_add = sort([zetas_star; zeta_star_new])
+                
+                k = sum(zetas_star .< zeta_star_new)
+                Ak = (xis_star[k+1] - xis_star[k]) / (zetas_star[k+1] - zetas_star[k])
+                U = rand()
+                xi_star = xis_star[k] + (zeta_star_new - zetas_star[k]) * (Ak - (zetas_star[k+1] - zeta_star_new) / (zetas_star[k+1] - zetas_star[k]) * log((1-U)/U))
+                xis_star_add = [xis_star[1:k]; xi_star; xis_star[(k+1):(K_star+1)]]
+                
+                # Dirichlet prior ratio for birth
+                Delta_k_old = zetas_star[k+1] - zetas_star[k]
+                Delta_k_new = zeta_star_new - zetas_star[k]
+                Delta_kp1_new = zetas_star[k+1] - zeta_star_new
+                
+                log_prior_ratio = loggamma((K+2) * alpha_zeta) - loggamma((K+1) * alpha_zeta) - loggamma(alpha_zeta) +
+                                  (alpha_zeta - 1) * (log(Delta_k_new) + log(Delta_kp1_new) - log(Delta_k_old))
+                
+                log_a_BM = loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star_add[2:(K_star+1)], xis_star_add) - 
+                           loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star[2:(K+1)], xis_star) +
+                           log_prior_ratio +
+                           log(pdf(Normal(xis_star[k], sigma_xi_star), xi_star)) +
+                           log(pdf(Normal(xi_star, sigma_xi_star), xis_star[k+1])) - 
+                           log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
+                           log((1-r_KB)/(K+1)) - log(r_KB_star/(b-a)) - log(U*(1-U)) + log(mu_K) - log(K+1)
+                
+                acc_BM_prob = min(1, exp(log_a_BM))
+                acc_MHM = rand() < acc_BM_prob
+            
+                if acc_MHM
+                    K_all[iter] = K_star
+                    aK_all[iter] = 1
+                    zetas_all[1:K_star,iter] = zetas_star_add[2:(K_star+1)]
+                    xis_all[1:(K_star+2),iter] = xis_star_add
+                    K = K_star
+                    zetas = zetas_star_add[2:(K_star+1)]
+                    xis = xis_star_add
+                    sigma_xi = sigma_xi_star
+                else
+                    K_all[iter] = K
+                    aK_all[iter] = 0
+                    zetas_all[1:K,iter] = zetas_star[2:(K+1)]
+                    xis_all[1:(K+2),iter] = xis_star
+                    zetas = zetas_star[2:(K+1)]
+                    xis = xis_star
+                    sigma_xi = sigma_xi_star
+                end
+                    
+            else 
+                # ------------ Death Move for zeta ------------
+                k = rand(1:K)
+                zetas_star_rm = deleteat!(copy(zetas_star), k+1)
+                xis_star_rm = deleteat!(copy(xis_star), k+1)
+
+                A_kp1 = (xis_star[k+2]-xis_star[k+1])/(zetas_star[k+2]-zetas_star[k+1])
+                A_k = (xis_star[k+1]-xis_star[k])/(zetas_star[k+1]-zetas_star[k])
+                U = exp(A_k)/(exp(A_k)+exp(A_kp1))
+                
+                # Dirichlet prior ratio for death
+                Delta_k_old = zetas_star[k+1] - zetas_star[k]
+                Delta_kp1_old = zetas_star[k+2] - zetas_star[k+1]
+                Delta_k_new = zetas_star_rm[k+1] - zetas_star_rm[k]
+                
+                log_prior_ratio = loggamma(K * alpha_zeta) + loggamma(alpha_zeta) - loggamma((K+1) * alpha_zeta) +
+                                  (alpha_zeta - 1) * (log(Delta_k_new) - log(Delta_k_old) - log(Delta_kp1_old))
+                
+                log_a_DM = loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star_rm[2:(K_star+1)], xis_star_rm) - 
+                           loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star[2:(K+1)], xis_star) +
+                           log_prior_ratio +
+                           log(pdf(Normal(xis_star_rm[k], sigma_xi_star), xis_star_rm[k+1])) - 
+                           log(pdf(Normal(xis_star[k+1], sigma_xi_star), xis_star[k+2])) -
+                           log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
+                           log(r_KB/(b-a)) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
+                
+                acc_DM_prob = min(1, exp(log_a_DM))
+                acc_MHM = rand() < acc_DM_prob
+            
+                if acc_MHM
+                    K_all[iter] = K_star
+                    aK_all[iter] = 1
+                    if K_star == 0
+                        zetas_all[1:K_star,iter] = zeros(K_star)
+                    else
+                        zetas_all[1:K_star,iter] = zetas_star_rm[2:(K_star+1)]
+                    end
+                    xis_all[1:(K_star+2),iter] = xis_star_rm
+                    K = K_star
+                    zetas = zetas_star_rm[2:(K_star+1)]
+                    xis = xis_star_rm
+                    sigma_xi = sigma_xi_star
+                else
+                    K_all[iter] = K
+                    aK_all[iter] = 0
+                    zetas_all[1:K,iter] = zetas_star[2:(K+1)]
+                    xis_all[1:(K+2),iter] = xis_star
+                    zetas = zetas_star[2:(K+1)]
+                    xis = xis_star
+                    sigma_xi = sigma_xi_star
+                end
+            end
+        else
+            K_all[iter] = K
+            aK_all[iter] = 0
+            zetas_all[1:K,iter] = zetas_star[2:(K+1)]
+            xis_all[1:(K+2),iter] = xis_star
+            zetas = zetas_star[2:(K+1)]
+            xis = xis_star
+            sigma_xi = sigma_xi_star
+        end
+        
+        # ----------------------------- Update alpha_tau (Eq. 6 in supplement) -----------------------------
+        taus_ = [0.0; taus; tau]
+        if H >= 0
+            S_tau = sum(log.(diff(taus_)))
+            
+            # Propose on log-scale
+            log_alpha_tau = log(alpha_tau)
+            log_alpha_tau_star = rand(Normal(log_alpha_tau, c_alpha))
+            alpha_tau_star = exp(log_alpha_tau_star)
+            
+            # Log acceptance ratio (Eq. 7)
+            log_r_alpha = (a_tau - 1) * (log_alpha_tau_star - log_alpha_tau) - 
+                          b_tau * (alpha_tau_star - alpha_tau) +
+                          loggamma((H+1) * alpha_tau_star) - loggamma((H+1) * alpha_tau) -
+                          (H+1) * (loggamma(alpha_tau_star) - loggamma(alpha_tau)) +
+                          (alpha_tau_star - alpha_tau) * S_tau +
+                          (log_alpha_tau_star - log_alpha_tau)  # Jacobian
+            
+            if rand() < min(1, exp(log_r_alpha))
+                alpha_tau = alpha_tau_star
+            end
+        end
+        alpha_tau_all[iter] = alpha_tau
+        
+        # ----------------------------- Update alpha_zeta -----------------------------
+        zetas_ = [a; zetas; b]
+        if K >= 0
+            S_zeta = sum(log.(diff(zetas_)))
+            
+            log_alpha_zeta = log(alpha_zeta)
+            log_alpha_zeta_star = rand(Normal(log_alpha_zeta, c_alpha))
+            alpha_zeta_star = exp(log_alpha_zeta_star)
+            
+            log_r_alpha = (a_zeta - 1) * (log_alpha_zeta_star - log_alpha_zeta) - 
+                          b_zeta * (alpha_zeta_star - alpha_zeta) +
+                          loggamma((K+1) * alpha_zeta_star) - loggamma((K+1) * alpha_zeta) -
+                          (K+1) * (loggamma(alpha_zeta_star) - loggamma(alpha_zeta)) +
+                          (alpha_zeta_star - alpha_zeta) * S_zeta +
+                          (log_alpha_zeta_star - log_alpha_zeta)
+            
+            if rand() < min(1, exp(log_r_alpha))
+                alpha_zeta = alpha_zeta_star
+            end
+        end
+        alpha_zeta_all[iter] = alpha_zeta
+            
+        # ----------------------------- Adaptive tuning -----------------------------
+        if iter % n_report == 0
+            if Adapt_C
+                avg_gammas_aratio = mean(sum(agammas_all[:,(n_report*c_cnt+1):(n_report*(c_cnt+1))], dims=2) ./ n_report)
+                avg_xis_aratio = mean(sum(axis_all[:,(n_report*c_cnt+1):(n_report*(c_cnt+1))],dims=2) ./ n_report)
+                avg_betas_aratio = mean(sum(abetas_all[:,(n_report*c_cnt+1):(n_report*(c_cnt+1))],dims=2) ./ n_report) 
+                
+                if avg_gammas_aratio > AHigh
+                    c_gamma = min(c_gamma*2, 2)
+                end
+                if avg_gammas_aratio < ALow
+                    c_gamma = max(c_gamma/2, 0.0625)
+                end
+                if avg_xis_aratio > AHigh
+                    c_xi = min(c_xi*2, 2)
+                end
+                if avg_xis_aratio < ALow
+                    c_xi = max(c_xi/2, 0.0625)
+                end
+                if avg_betas_aratio > AHigh
+                    c_beta = min(c_beta*2, 2)
+                end
+                if avg_betas_aratio < ALow
+                    c_beta = max(c_beta/2, 0.0625)
+                end
+                c_cnt += 1
+            else
+                print("Iteration ", iter, " \n")
+            end 
+        end
+    end
+
+    results = Dict(
+        "H"=>H_all,
+        "taus"=>taus_all,
+        "gammas"=>gammas_all,
+        "sigmas_gamma"=>sigmas_gamma_all,
+        "K"=>K_all,
+        "zetas"=>zetas_all,
+        "xis"=>xis_all,
+        "sigmas_xi"=>sigmas_xi_all,
+        "betas"=>betas_all,
+        "tau"=> tau,
+        "Tmax" => tau,
+        "a"=> a,      
+        "b"=> b,
+        "ns" => NS,
+        "burn_in" => BI,
+        "alpha_tau" => alpha_tau_all,
+        "alpha_zeta" => alpha_zeta_all
     )
 
     return results
