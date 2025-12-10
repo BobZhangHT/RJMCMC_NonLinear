@@ -851,8 +851,19 @@ function main()
     limit = max(1, min(cfg.n_workers, nthreads()))
     sem = Base.Semaphore(limit)
 
+    # Execute tasks in order: first all linear, then all quad, then all sin
+    # Within each g_type, execute by n_values, then by replication index in order
+    # Replications are still executed in parallel within each (g_type, n) combination for efficiency
+    for g_type in cfg.g_types
+        println("Processing g_type: $(g_type)")
+        for n in cfg.n_values
+            println("  Processing n=$(n) for g_type=$(g_type)")
+            # Collect all tasks for this (g_type, n) combination, sorted by replication index
+            tasks_for_gn = [task for task in tasks if task.g_type == g_type && task.n == n]
+            sort!(tasks_for_gn, by=t -> t.idx)  # Ensure tasks are sorted by replication index
+            
     @sync begin
-        for task in tasks
+                for task in tasks_for_gn
             Threads.@spawn begin
                 Base.acquire(sem)
                 try
@@ -865,6 +876,10 @@ function main()
                 end
             end
         end
+            end
+            println("  Completed n=$(n) for g_type=$(g_type)")
+        end
+        println("Completed g_type: $(g_type)")
     end
 
     summarize_tasks(cfg, base_dir)

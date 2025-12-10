@@ -51,10 +51,10 @@ function default_simulation_config(mode::SimulationMode=full; n_workers::Int=max
     ns = 5000
     n_test = 500
     g_types = ["linear", "quad", "sin"]
-    # Demo: only n=200; Full: all manuscript sizes.
-    n_values = mode == demo ? [200] : [200, 400, 800]
+    # Demo: all manuscript sizes but with fewer replications; Full: all manuscript sizes.
+    n_values = [200, 400, 800]
     # Use a light footprint for demo, full manuscript settings use 1000 reps.
-    replications = mode == demo ? 10 : 1000
+    replications = mode == demo ? 5 : 1000
 
     burn_in = ns ÷ 2
     SimulationConfig(

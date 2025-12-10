@@ -1,9 +1,33 @@
 # Julia environment (add via Julia's package manager)
+# 
+# Installation methods (choose one):
+# 
+# Method 1 - Windows PowerShell (recommended):
+#   julia -e "using Pkg; Pkg.add([\"DataFrames\", \"CSV\", \"Distributions\", \"ProgressMeter\", \"StatsBase\", \"VectorizedStatistics\", \"MLDataUtils\", \"Plots\", \"StatsPlots\", \"CategoricalArrays\", \"LaTeXStrings\"])"
+# 
+# Method 2 - Interactive Julia REPL:
+#   julia
+#   ] add DataFrames CSV Distributions ProgressMeter StatsBase VectorizedStatistics MLDataUtils Plots StatsPlots CategoricalArrays LaTeXStrings
+#   (Press Ctrl+C to exit package mode, then type exit() to quit)
+# 
+# Method 3 - Create install_packages.jl script:
+#   Create a file install_packages.jl with: using Pkg; Pkg.add(["DataFrames", "CSV", "Distributions", "ProgressMeter", "StatsBase", "VectorizedStatistics", "MLDataUtils", "Plots", "StatsPlots", "CategoricalArrays", "LaTeXStrings"])
+#   Then run: julia install_packages.jl
+
+# Julia packages
 julia>=1.9
 DataFrames
 CSV
 Distributions
 ProgressMeter
-VectorizedStatistics
 StatsBase
+VectorizedStatistics
 MLDataUtils
+Plots
+StatsPlots
+CategoricalArrays
+LaTeXStrings
+
+# R packages (for boxplot generation)
+# Install with: Rscript -e "install.packages('ggplot2', repos='https://cran.rstudio.com/')"
+ggplot2
