@@ -30,7 +30,55 @@ struct SimulationTask
     idx::Int        # replication id
 end
 
-# Parse command-line flags (--demo/--full/--reset/--replot/--plot-only/--workers=N).
+const METHOD_ALIASES = Dict{String, Symbol}(
+    "all" => :all,
+    "nonlinear1" => :nonlinear1,
+    "nonlinear" => :nonlinear1,
+    "nl1" => :nonlinear1,
+    "nonlinear2" => :nonlinear2,
+    "nonlinear_dirichlet" => :nonlinear2,
+    "dirichlet" => :nonlinear2,
+    "nl2" => :nonlinear2,
+    "coxph" => :coxph,
+    "cox" => :coxph,
+)
+
+const METHOD_KEYS = Dict{Symbol, Vector{String}}(
+    :nonlinear1 => ["beta_nonlinear", "IBS_nonlinear", "Lambda_nonlinear", "g_nonlinear", "Hseq", "Kseq"],
+    :nonlinear2 => ["beta_nonlinear_dirichlet", "IBS_nonlinear_dirichlet", "Lambda_nonlinear_dirichlet", "g_nonlinear_dirichlet",
+        "Hseq_dirichlet", "Kseq_dirichlet", "alpha_tau_dirichlet", "alpha_zeta_dirichlet"],
+    :coxph => ["beta_coxph", "IBS_coxph", "Lambda_coxph", "Hseq_coxph"],
+)
+
+function parse_method_list(arg_value::AbstractString)
+    raw = lowercase(strip(arg_value))
+    if isempty(raw) || raw == "all"
+        return Set([:nonlinear1, :nonlinear2, :coxph])
+    end
+
+    parts = split(raw, ",")
+    methods = Set{Symbol}()
+    for p in parts
+        key = lowercase(strip(p))
+        if !haskey(METHOD_ALIASES, key) || METHOD_ALIASES[key] == :all
+            error("Unknown method '$p'. Use --methods=nonlinear1,nonlinear2,coxph (or --methods=all).")
+        end
+        push!(methods, METHOD_ALIASES[key])
+    end
+    return methods
+end
+
+function method_done(results_dict::Dict, method::Symbol)
+    keys = METHOD_KEYS[method]
+    for k in keys
+        if !haskey(results_dict, k)
+            return false
+        end
+    end
+    return true
+end
+
+# Parse command-line flags (--demo/--full/--reset/--replot/--plot-only/--workers=N/--methods=.../--rerun-methods=...).
 function parse_args()
     mode = Config.full
     reset = false
@@ -38,6 +86,8 @@ function parse_args()
     plot_only = false
     # Default to use all available CPU threads
     workers = nthreads()
+    methods_to_run = Set([:nonlinear1, :nonlinear2, :coxph])
+    rerun_methods = Set{Symbol}()
 
     for arg in ARGS
         if arg == "--demo"
@@ -52,10 +102,18 @@ function parse_args()
             plot_only = true
         elseif startswith(arg, "--workers=")
             workers = parse(Int, split(arg, "=")[2])
+        elseif arg == "--only-nonlinear2" || arg == "--only-nl2"
+            methods_to_run = Set([:nonlinear2])
+        elseif startswith(arg, "--methods=")
+            methods_to_run = parse_method_list(split(arg, "=")[2])
+        elseif startswith(arg, "--rerun-methods=")
+            rerun_methods = parse_method_list(split(arg, "=")[2])
+        elseif startswith(arg, "--force-methods=")
+            rerun_methods = parse_method_list(split(arg, "=")[2])
         end
     end
 
-    return mode, reset, replot, plot_only, workers
+    return mode, reset, replot, plot_only, workers, methods_to_run, rerun_methods
 end
 
 # Synthetic survival data generator mirroring the notebook setup.
@@ -134,154 +192,356 @@ function task_dir(base_dir::String, task::SimulationTask)
     joinpath(base_dir, "g=$(task.g_type)", "n=$(task.n)", "rep=$(task.idx)")
 end
 
-function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::String)
+function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::String, methods_to_run::Set{Symbol}, rerun_methods::Set{Symbol})
+    println("[Task rep=$(task.idx)] Starting task execution on thread $(Threads.threadid())")
+    
+    # Performance timing
+    timings = Dict{String, Float64}()
+    t_start = time()
+    t_last = t_start
+    
     dir = task_dir(base_dir, task)
     results_path = joinpath(dir, "results_dict.jls")
+    existing = Dict{Any, Any}()
     if isfile(results_path)
-        return :skipped
+        try
+            t1 = time()
+            open(results_path, "r") do io
+                existing = deserialize(io)
+            end
+            timings["read_existing"] = time() - t1
+        catch err
+            @warn "Failed to read existing results file $(results_path); will recompute selected methods." exception=(err, catch_backtrace())
+            existing = Dict{Any, Any}()
+        end
     end
+    
+    t_last = time()
+    timings["init"] = t_last - t_start
 
     mkpath(dir)
     train_path = joinpath(dir, "dat_train.csv")
     test_path = joinpath(dir, "dat_test.csv")
 
+    # Generate data only if files don't exist, otherwise read from cache
+    t1 = time()
     if !isfile(train_path) || !isfile(test_path)
+        t_data = time()
         df_train = data_gen(task.idx; g_type=task.g_type, n=task.n, hazard_a=cfg.hazard_a, hazard_b=cfg.hazard_b, z_min=cfg.z_min, z_max=cfg.z_max)
         df_test = data_gen(task.idx + cfg.data_seed; g_type=task.g_type, n=cfg.n_test, hazard_a=cfg.hazard_a, hazard_b=cfg.hazard_b, z_min=cfg.z_min, z_max=cfg.z_max)
+        timings["data_gen"] = time() - t_data
+        
+        t_write = time()
         CSV.write(train_path, df_train)
         CSV.write(test_path, df_test)
+        timings["data_write"] = time() - t_write
+        
+        # Extract data directly from generated DataFrames to avoid re-reading
+        Y_train, Delta_train = df_train.Y, df_train.Delta
+        X_train = hcat(Float64.(df_train.X1), Float64.(df_train.X2))
+        Z_train = df_train.Z
+        Y_test, Delta_test = df_test.Y, df_test.Delta
+        X_test = hcat(Float64.(df_test.X1), Float64.(df_test.X2))
+        Z_test = df_test.Z
+    else
+        # Only read CSV if files already exist
+        t_read = time()
+        df_train = CSV.read(train_path, DataFrame)
+        df_test = CSV.read(test_path, DataFrame)
+        timings["data_read"] = time() - t_read
+        
+        Y_train, Delta_train = df_train.Y, df_train.Delta
+        X_train = hcat(Float64.(df_train.X1), Float64.(df_train.X2))
+        Z_train = df_train.Z
+        Y_test, Delta_test = df_test.Y, df_test.Delta
+        X_test = hcat(Float64.(df_test.X1), Float64.(df_test.X2))
+        Z_test = df_test.Z
     end
+    timings["data_io"] = time() - t1
 
-    df_train = CSV.read(train_path, DataFrame)
-    df_test = CSV.read(test_path, DataFrame)
-
-    Y_train, Delta_train = df_train.Y, df_train.Delta
-    X_train = Matrix(df_train[:, [:X1, :X2]])
-    Z_train = df_train.Z
-
-    Y_test, Delta_test = df_test.Y, df_test.Delta
-    X_test = Matrix(df_test[:, [:X1, :X2]])
-    Z_test = df_test.Z
 
     # Use known support for Z to avoid boundary bias/kinks when plotting on full grid.
     a, b = cfg.z_min, cfg.z_max
 
-    # NonLinear1: Default uniform order statistics prior
-    results_nonlinear = RJMCMC_Nonlinear(X_train, Z_train, Delta_train, Y_train, a, b, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX, Hcan=20, Kcan=20)
-    
-    # NonLinear2: Dirichlet-Gamma prior for knot locations
-    results_nonlinear_dirichlet = RJMCMC_Nonlinear_Dirichlet(X_train, Z_train, Delta_train, Y_train, a, b, cfg.mcmc_seed + 1000; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX)
-    
-    # CoxPH baseline
-    results_coxph = RJMCMC_CoxPH(X_train, Z_train, Delta_train, Y_train, cfg.mcmc_seed; ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Hcan=20)
+    parallel_run = cfg.n_workers > 1 && nthreads() > 1
+    # Always disable MCMC progress bar, only show task-level progress
+    show_mcmc_progress = false
 
-    ns = results_nonlinear["ns"]
-    bi = results_nonlinear["burn_in"]
+    need_nl1 = (:nonlinear1 in methods_to_run) && (:nonlinear1 in rerun_methods || !method_done(existing, :nonlinear1))
+    need_nl2 = (:nonlinear2 in methods_to_run) && (:nonlinear2 in rerun_methods || !method_done(existing, :nonlinear2))
+    need_cox = (:coxph in methods_to_run) && (:coxph in rerun_methods || !method_done(existing, :coxph))
+
+    if !(need_nl1 || need_nl2 || need_cox)
+        return :skipped
+    end
+
+    ns = cfg.ns
+    bi = cfg.burn_in
     t_grid = cfg.t_grid
     z_grid = cfg.z_grid
 
-    # ========== NonLinear1 (Default Prior) ==========
-    K_all, zetas_all, xis_all = results_nonlinear["K"], results_nonlinear["zetas"], results_nonlinear["xis"]
-    H_all, taus_all, gammas_all = results_nonlinear["H"], results_nonlinear["taus"], results_nonlinear["gammas"]
-    Tmax = results_nonlinear["Tmax"]
+    g_tmp = zeros(length(z_grid))
+    g_knots = Vector{Float64}(undef, DEFAULT_KMAX + 2)
+    Lambda_tmp = zeros(length(t_grid))
+    h_knots = Vector{Float64}(undef, DEFAULT_HMAX + 2)
+    h_cumhaz = Vector{Float64}(undef, DEFAULT_HMAX + 2)
 
-    g_pos = zeros(length(z_grid))
-    for i in (bi + 1):ns
-        K = Int(K_all[i])
-        zetas = zetas_all[1:K, i]
-        xis = xis_all[1:(K + 2), i]
-        g_pos .+= g_fun_est(z_grid, a, b, zetas, xis)
-    end
-    g_pos ./= (ns - bi)
+    results_dict = existing
 
-    # Evaluate Λ following notebook approach
-    # Key insight: evaluate Lambda on full t_grid, but clamp t values to tau
-    # This produces smooth curves without artificial kinks at Tmax
-    Lambda_nonlinear = zeros(length(t_grid))
-    for i in (bi + 1):ns
-        H = Int(H_all[i])
-        taus = taus_all[1:H, i]
-        gammas = gammas_all[1:(H + 2), i]
-        # Lambda_fun_est already clamps t to tau internally, so we can pass full t_grid
-        # This ensures smooth extrapolation beyond Tmax
-        Lambda_nonlinear .+= Lambda_fun_est(t_grid, Tmax, taus, gammas)
-    end
-    Lambda_nonlinear ./= (ns - bi)
+    if need_nl1
+        println("[Task rep=$(task.idx)] Starting NonLinear1 MCMC...")
+        t_nl1_start = time()
+        # Use unique seed per task to avoid RNG conflicts in parallel execution
+        mcmc_seed_nl1 = cfg.mcmc_seed + task.idx * 10000
+        t_mcmc = time()
+        results_nonlinear = RJMCMC_Nonlinear(X_train, Z_train, Delta_train, Y_train, a, b, mcmc_seed_nl1;
+            ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX, show_progress=show_mcmc_progress)
+        timings["nl1_mcmc"] = time() - t_mcmc
+        println("[Task rep=$(task.idx)] NonLinear1 MCMC completed in $(round(timings["nl1_mcmc"], digits=2))s")
 
-    # ========== NonLinear2 (Dirichlet-Gamma Prior) ==========
-    K_all_dir, zetas_all_dir, xis_all_dir = results_nonlinear_dirichlet["K"], results_nonlinear_dirichlet["zetas"], results_nonlinear_dirichlet["xis"]
-    H_all_dir, taus_all_dir, gammas_all_dir = results_nonlinear_dirichlet["H"], results_nonlinear_dirichlet["taus"], results_nonlinear_dirichlet["gammas"]
-    Tmax_dir = results_nonlinear_dirichlet["Tmax"]
+        K_all, zetas_all, xis_all = results_nonlinear["K"], results_nonlinear["zetas"], results_nonlinear["xis"]
+        H_all, taus_all, gammas_all = results_nonlinear["H"], results_nonlinear["taus"], results_nonlinear["gammas"]
+        Tmax = results_nonlinear["Tmax"]
 
-    g_pos_dirichlet = zeros(length(z_grid))
-    for i in (bi + 1):ns
-        K = Int(K_all_dir[i])
-        zetas = zetas_all_dir[1:K, i]
-        xis = xis_all_dir[1:(K + 2), i]
-        g_pos_dirichlet .+= g_fun_est(z_grid, a, b, zetas, xis)
-    end
-    g_pos_dirichlet ./= (ns - bi)
+        t_g = time()
+        g_pos = zeros(length(z_grid))
+        for i in (bi + 1):ns
+            K = Int(K_all[i])
+            zetas = zetas_all[1:K, i]
+            xis = xis_all[1:(K + 2), i]
+            RJMCMCModel.g_fun_est!(g_tmp, z_grid, a, b, zetas, xis, g_knots)
+            g_pos .+= g_tmp
+        end
+        g_pos ./= (ns - bi)
+        timings["nl1_g_est"] = time() - t_g
 
-    Lambda_nonlinear_dirichlet = zeros(length(t_grid))
-    for i in (bi + 1):ns
-        H = Int(H_all_dir[i])
-        taus = taus_all_dir[1:H, i]
-        gammas = gammas_all_dir[1:(H + 2), i]
-        Lambda_nonlinear_dirichlet .+= Lambda_fun_est(t_grid, Tmax_dir, taus, gammas)
-    end
-    Lambda_nonlinear_dirichlet ./= (ns - bi)
+        t_lambda = time()
+        Lambda_nonlinear = zeros(length(t_grid))
+        for i in (bi + 1):ns
+            H = Int(H_all[i])
+            taus = taus_all[1:H, i]
+            gammas = gammas_all[1:(H + 2), i]
+            RJMCMCModel.Lambda_fun_est!(Lambda_tmp, t_grid, Tmax, taus, gammas, h_knots, h_cumhaz)
+            Lambda_nonlinear .+= Lambda_tmp
+        end
+        Lambda_nonlinear ./= (ns - bi)
+        timings["nl1_lambda_est"] = time() - t_lambda
 
-    # ========== CoxPH ==========
-    H_cox_all, taus_cox_all, gammas_cox_all = results_coxph["H"], results_coxph["taus"], results_coxph["gammas"]
-    Lambda_coxph = zeros(length(t_grid))
-    for i in (bi + 1):ns
-        H = Int(H_cox_all[i])
-        taus = taus_cox_all[1:H, i]
-        gammas = gammas_cox_all[1:(H + 2), i]
-        # Lambda_fun_est already clamps t to tau internally
-        Lambda_coxph .+= Lambda_fun_est(t_grid, Tmax, taus, gammas)
-    end
-    Lambda_coxph ./= (ns - bi)
+        println("[Task rep=$(task.idx)] Computing NonLinear1 IBS...")
+        t_ibs = time()
+        # Use reduced n_int for faster IBS computation (can be adjusted for accuracy vs speed tradeoff)
+        # Default n_int=200 is very slow; using 50 provides good balance with acceptable accuracy
+        # The IBS function will automatically use sparse MCMC sampling when n_samples > 2000
+        IBS_nonlinear = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_nonlinear, "nonlinear", 50, cfg.mcmc_seed; show_progress=false)
+        timings["nl1_ibs"] = time() - t_ibs
+        println("[Task rep=$(task.idx)] NonLinear1 IBS completed in $(round(timings["nl1_ibs"], digits=2))s")
+        
+        timings["nl1_total"] = time() - t_nl1_start
 
-    # ========== IBS Calculations ==========
-    IBS_coxph = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_coxph, "coxph")
-    IBS_nonlinear = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_nonlinear, "nonlinear")
-    IBS_nonlinear_dirichlet = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_nonlinear_dirichlet, "nonlinear")
-
-    results_dict = Dict(
-        # CoxPH results
-        "beta_coxph" => results_coxph["betas"],
-        "IBS_coxph" => IBS_coxph,
-        "Lambda_coxph" => Lambda_coxph,
-        "Hseq_coxph" => results_coxph["H"][bi+1:ns],
-        # NonLinear1 (Default Prior) results
-        "beta_nonlinear" => results_nonlinear["betas"],
-        "IBS_nonlinear" => IBS_nonlinear,
-        "Lambda_nonlinear" => Lambda_nonlinear,
-        "g_nonlinear" => g_pos,
-        "Hseq" => results_nonlinear["H"][bi+1:ns],
-        "Kseq" => results_nonlinear["K"][bi+1:ns],
-        # NonLinear2 (Dirichlet-Gamma Prior) results
-        "beta_nonlinear_dirichlet" => results_nonlinear_dirichlet["betas"],
-        "IBS_nonlinear_dirichlet" => IBS_nonlinear_dirichlet,
-        "Lambda_nonlinear_dirichlet" => Lambda_nonlinear_dirichlet,
-        "g_nonlinear_dirichlet" => g_pos_dirichlet,
-        "Hseq_dirichlet" => results_nonlinear_dirichlet["H"][bi+1:ns],
-        "Kseq_dirichlet" => results_nonlinear_dirichlet["K"][bi+1:ns],
-        "alpha_tau_dirichlet" => results_nonlinear_dirichlet["alpha_tau"][bi+1:ns],
-        "alpha_zeta_dirichlet" => results_nonlinear_dirichlet["alpha_zeta"][bi+1:ns],
-        # Common
-        "Tmax" => Tmax,
-        "ns" => ns,
-        "burn_in" => bi,
-        "mode" => string(cfg.mode),
-    )
-
-    open(results_path, "w") do file
-        serialize(file, results_dict)
+        results_dict["beta_nonlinear"] = results_nonlinear["betas"]
+        results_dict["IBS_nonlinear"] = IBS_nonlinear
+        results_dict["Lambda_nonlinear"] = Lambda_nonlinear
+        results_dict["g_nonlinear"] = g_pos
+        results_dict["Hseq"] = results_nonlinear["H"][bi+1:ns]
+        results_dict["Kseq"] = results_nonlinear["K"][bi+1:ns]
+        results_dict["Tmax"] = Tmax
     end
 
-    return :done
+    if need_nl2
+        println("[Task rep=$(task.idx)] Starting NonLinear2 MCMC...")
+        t_nl2_start = time()
+        # Use unique seed per task to avoid RNG conflicts in parallel execution
+        mcmc_seed_nl2 = cfg.mcmc_seed + 1000 + task.idx * 10000
+        t_mcmc = time()
+        results_nonlinear_dirichlet = RJMCMC_Nonlinear_Dirichlet(X_train, Z_train, Delta_train, Y_train, a, b, mcmc_seed_nl2;
+            ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, Kmax=DEFAULT_KMAX, 
+            a_tau=1.0, b_tau=1.0, a_zeta=1.0, b_zeta=1.0, show_progress=show_mcmc_progress)
+        timings["nl2_mcmc"] = time() - t_mcmc
+        println("[Task rep=$(task.idx)] NonLinear2 MCMC completed in $(round(timings["nl2_mcmc"], digits=2))s")
+
+        K_all_dir, zetas_all_dir, xis_all_dir = results_nonlinear_dirichlet["K"], results_nonlinear_dirichlet["zetas"], results_nonlinear_dirichlet["xis"]
+        H_all_dir, taus_all_dir, gammas_all_dir = results_nonlinear_dirichlet["H"], results_nonlinear_dirichlet["taus"], results_nonlinear_dirichlet["gammas"]
+        Tmax_dir = results_nonlinear_dirichlet["Tmax"]
+
+        t_g = time()
+        g_pos_dirichlet = zeros(length(z_grid))
+        for i in (bi + 1):ns
+            K = Int(K_all_dir[i])
+            zetas = zetas_all_dir[1:K, i]
+            xis = xis_all_dir[1:(K + 2), i]
+            RJMCMCModel.g_fun_est!(g_tmp, z_grid, a, b, zetas, xis, g_knots)
+            g_pos_dirichlet .+= g_tmp
+        end
+        g_pos_dirichlet ./= (ns - bi)
+        timings["nl2_g_est"] = time() - t_g
+
+        t_lambda = time()
+        Lambda_nonlinear_dirichlet = zeros(length(t_grid))
+        for i in (bi + 1):ns
+            H = Int(H_all_dir[i])
+            taus = taus_all_dir[1:H, i]
+            gammas = gammas_all_dir[1:(H + 2), i]
+            RJMCMCModel.Lambda_fun_est!(Lambda_tmp, t_grid, Tmax_dir, taus, gammas, h_knots, h_cumhaz)
+            Lambda_nonlinear_dirichlet .+= Lambda_tmp
+        end
+        Lambda_nonlinear_dirichlet ./= (ns - bi)
+        timings["nl2_lambda_est"] = time() - t_lambda
+
+        println("[Task rep=$(task.idx)] Computing NonLinear2 IBS...")
+        t_ibs = time()
+        # Use reduced n_int for faster IBS computation
+        # The IBS function will automatically use sparse MCMC sampling when n_samples > 2000
+        IBS_nonlinear_dirichlet = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_nonlinear_dirichlet, "nonlinear", 50, cfg.mcmc_seed + 1000; show_progress=false)
+        timings["nl2_ibs"] = time() - t_ibs
+        println("[Task rep=$(task.idx)] NonLinear2 IBS completed in $(round(timings["nl2_ibs"], digits=2))s")
+        
+        timings["nl2_total"] = time() - t_nl2_start
+
+        results_dict["beta_nonlinear_dirichlet"] = results_nonlinear_dirichlet["betas"]
+        results_dict["IBS_nonlinear_dirichlet"] = IBS_nonlinear_dirichlet
+        results_dict["Lambda_nonlinear_dirichlet"] = Lambda_nonlinear_dirichlet
+        results_dict["g_nonlinear_dirichlet"] = g_pos_dirichlet
+        results_dict["Hseq_dirichlet"] = results_nonlinear_dirichlet["H"][bi+1:ns]
+        results_dict["Kseq_dirichlet"] = results_nonlinear_dirichlet["K"][bi+1:ns]
+        results_dict["alpha_tau_dirichlet"] = results_nonlinear_dirichlet["alpha_tau"][bi+1:ns]
+        results_dict["alpha_zeta_dirichlet"] = results_nonlinear_dirichlet["alpha_zeta"][bi+1:ns]
+        if !haskey(results_dict, "Tmax")
+            results_dict["Tmax"] = Tmax_dir
+        end
+    end
+
+    if need_cox
+        println("[Task rep=$(task.idx)] Starting CoxPH MCMC...")
+        t_cox_start = time()
+        # Use unique seed per task to avoid RNG conflicts in parallel execution
+        mcmc_seed_cox = cfg.mcmc_seed + task.idx * 10000
+        t_mcmc = time()
+        results_coxph = RJMCMC_CoxPH(X_train, Z_train, Delta_train, Y_train, mcmc_seed_cox;
+            ns=cfg.ns, burn_in=cfg.burn_in, Hmax=DEFAULT_HMAX, show_progress=show_mcmc_progress)
+        timings["cox_mcmc"] = time() - t_mcmc
+        println("[Task rep=$(task.idx)] CoxPH MCMC completed in $(round(timings["cox_mcmc"], digits=2))s")
+
+        H_cox_all, taus_cox_all, gammas_cox_all = results_coxph["H"], results_coxph["taus"], results_coxph["gammas"]
+        Tmax_cox = get(results_coxph, "Tmax", results_coxph["tau"])
+
+        t_lambda = time()
+        Lambda_coxph = zeros(length(t_grid))
+        for i in (bi + 1):ns
+            H = Int(H_cox_all[i])
+            taus = taus_cox_all[1:H, i]
+            gammas = gammas_cox_all[1:(H + 2), i]
+            RJMCMCModel.Lambda_fun_est!(Lambda_tmp, t_grid, Tmax_cox, taus, gammas, h_knots, h_cumhaz)
+            Lambda_coxph .+= Lambda_tmp
+        end
+        Lambda_coxph ./= (ns - bi)
+        timings["cox_lambda_est"] = time() - t_lambda
+
+        println("[Task rep=$(task.idx)] Computing CoxPH IBS...")
+        t_ibs = time()
+        # Use reduced n_int for faster IBS computation
+        # The IBS function will automatically use sparse MCMC sampling when n_samples > 2000
+        IBS_coxph = IBS(Y_train, Delta_train, X_train, Z_train, Y_test, Delta_test, X_test, Z_test, results_coxph, "coxph", 50, cfg.mcmc_seed; show_progress=false)
+        timings["cox_ibs"] = time() - t_ibs
+        println("[Task rep=$(task.idx)] CoxPH IBS completed in $(round(timings["cox_ibs"], digits=2))s")
+        
+        timings["cox_total"] = time() - t_cox_start
+
+        results_dict["beta_coxph"] = results_coxph["betas"]
+        results_dict["IBS_coxph"] = IBS_coxph
+        results_dict["Lambda_coxph"] = Lambda_coxph
+        results_dict["Hseq_coxph"] = results_coxph["H"][bi+1:ns]
+        if !haskey(results_dict, "Tmax")
+            results_dict["Tmax"] = Tmax_cox
+        end
+    end
+
+    results_dict["ns"] = ns
+    results_dict["burn_in"] = bi
+    results_dict["mode"] = string(cfg.mode)
+
+    # Optimized file writing: use atomic write with retry for Windows compatibility
+    # Use unique temp filename per task to avoid conflicts when tasks run in parallel
+    t_serialize = time()
+    task_id = hash((task.g_type, task.n, task.idx))
+    tmp_path = results_path * ".tmp_$(task_id)"
+    try
+        t_serialize_start = time()
+        open(tmp_path, "w") do file
+            serialize(file, results_dict)
+        end
+        timings["serialize"] = time() - t_serialize_start
+        
+        t_file_move = time()
+        # Windows file locking workaround: use retry with exponential backoff
+        written = false
+        max_retries = 5
+        for retry in 1:max_retries
+            try
+                # Try atomic move first (fastest)
+                mv(tmp_path, results_path; force=true)
+                written = true
+                break
+            catch e
+                if retry < max_retries
+                    # Wait with exponential backoff (Windows antivirus/file indexing can lock files)
+                    sleep(0.1 * retry)
+                    # Try copy-and-remove as fallback
+                    try
+                        cp(tmp_path, results_path; force=true)
+                        # Try to remove temp file, but don't fail if it's locked
+                        try
+                            rm(tmp_path; force=true)
+                        catch
+                            # File might be locked, will be cleaned up later
+                        end
+                        written = true
+                        break
+                    catch
+                        # Continue to next retry
+                    end
+                else
+                    # Last attempt: try copy without removing temp file
+                    try
+                        cp(tmp_path, results_path; force=true)
+                        written = true
+                        break
+                    catch
+                        # If all else fails, rethrow the original error
+                        rethrow(e)
+                    end
+                end
+            end
+        end
+        if !written
+            error("Failed to write results file after $(max_retries) attempts")
+        end
+        timings["file_write"] = time() - t_file_move
+    catch
+        # Clean up temp file if something went wrong
+        if isfile(tmp_path)
+            try rm(tmp_path; force=true) catch end
+        end
+        rethrow()
+    end
+    timings["save_total"] = time() - t_serialize
+
+    timings["total"] = time() - t_start
+    
+    # Store timings in a thread-safe way (using lock for printing)
+    task_label = "g=$(task.g_type),n=$(task.n),rep=$(task.idx)"
+    
+    # Print timing summary (thread-safe with lock)
+    timing_str = "\n[Timing] $task_label (thread $(Threads.threadid())):\n"
+    total_time = timings["total"]
+    # Sort by value (time) in descending order
+    sorted_timings = sort(collect(pairs(timings)), by=x->x.second, rev=true)
+    for (key, val) in sorted_timings
+        pct = total_time > 0 ? round(100*val/total_time, digits=1) : 0.0
+        timing_str *= "  $(rpad(key, 25)): $(rpad(round(val, digits=3), 8))s ($(pct)%)\n"
+    end
+    println(timing_str)
+
+    return :updated
 end
 
 # Aggregate posterior summaries and IBS metrics across completed replications.
@@ -362,20 +622,26 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 bi = results_dict["burn_in"]
 
                 # NonLinear1 (Default Prior)
-                push!(betas_nonlinear_mat, mean(results_dict["beta_nonlinear"][1, (bi+1):ns]))
-                push!(betas_se_nonlinear_mat, std(results_dict["beta_nonlinear"][1, (bi+1):ns]))
-                push!(betas_nonlinear_mat2, mean(results_dict["beta_nonlinear"][2, (bi+1):ns]))
-                push!(betas_se_nonlinear_mat2, std(results_dict["beta_nonlinear"][2, (bi+1):ns]))
-                push!(H_nonlinear, mean(results_dict["Hseq"]))
-                push!(K_nonlinear, mean(results_dict["Kseq"]))
+                if haskey(results_dict, "beta_nonlinear")
+                    push!(betas_nonlinear_mat, mean(results_dict["beta_nonlinear"][1, (bi+1):ns]))
+                    push!(betas_se_nonlinear_mat, std(results_dict["beta_nonlinear"][1, (bi+1):ns]))
+                    push!(betas_nonlinear_mat2, mean(results_dict["beta_nonlinear"][2, (bi+1):ns]))
+                    push!(betas_se_nonlinear_mat2, std(results_dict["beta_nonlinear"][2, (bi+1):ns]))
+                    push!(H_nonlinear, mean(results_dict["Hseq"]))
+                    push!(K_nonlinear, mean(results_dict["Kseq"]))
 
-                cr1 = quantile(results_dict["beta_nonlinear"][1, (bi+1):ns], [0.025, 0.975])
-                push!(cr1_nonlinear, cr1[1] <= 0.5 <= cr1[2])
-                cr2 = quantile(results_dict["beta_nonlinear"][2, (bi+1):ns], [0.025, 0.975])
-                push!(cr2_nonlinear, cr2[1] <= 0.5 <= cr2[2])
+                    cr1 = quantile(results_dict["beta_nonlinear"][1, (bi+1):ns], [0.025, 0.975])
+                    push!(cr1_nonlinear, cr1[1] <= 0.5 <= cr1[2])
+                    cr2 = quantile(results_dict["beta_nonlinear"][2, (bi+1):ns], [0.025, 0.975])
+                    push!(cr2_nonlinear, cr2[1] <= 0.5 <= cr2[2])
 
-                push!(g_samples, results_dict["g_nonlinear"])
-                push!(lambda_non_samples, results_dict["Lambda_nonlinear"])
+                    if haskey(results_dict, "g_nonlinear")
+                        push!(g_samples, results_dict["g_nonlinear"])
+                    end
+                    if haskey(results_dict, "Lambda_nonlinear")
+                        push!(lambda_non_samples, results_dict["Lambda_nonlinear"])
+                    end
+                end
 
                 # NonLinear2 (Dirichlet-Gamma Prior)
                 if haskey(results_dict, "beta_nonlinear_dirichlet")
@@ -398,43 +664,53 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 end
 
                 # CoxPH
-                push!(betas_coxph_mat, mean(results_dict["beta_coxph"][1, (bi+1):ns]))
-                push!(betas_se_coxph_mat, std(results_dict["beta_coxph"][1, (bi+1):ns]))
-                push!(betas_coxph_mat2, mean(results_dict["beta_coxph"][2, (bi+1):ns]))
-                push!(betas_se_coxph_mat2, std(results_dict["beta_coxph"][2, (bi+1):ns]))
-                push!(H_coxph, mean(results_dict["Hseq_coxph"]))
-                push!(lambda_cox_samples, results_dict["Lambda_coxph"])
+                if haskey(results_dict, "beta_coxph")
+                    push!(betas_coxph_mat, mean(results_dict["beta_coxph"][1, (bi+1):ns]))
+                    push!(betas_se_coxph_mat, std(results_dict["beta_coxph"][1, (bi+1):ns]))
+                    push!(betas_coxph_mat2, mean(results_dict["beta_coxph"][2, (bi+1):ns]))
+                    push!(betas_se_coxph_mat2, std(results_dict["beta_coxph"][2, (bi+1):ns]))
+                    push!(H_coxph, mean(results_dict["Hseq_coxph"]))
+                    if haskey(results_dict, "Lambda_coxph")
+                        push!(lambda_cox_samples, results_dict["Lambda_coxph"])
+                    end
 
-                cr1c = quantile(results_dict["beta_coxph"][1, (bi+1):ns], [0.025, 0.975])
-                push!(cr1_coxph, cr1c[1] <= 0.5 <= cr1c[2])
-                cr2c = quantile(results_dict["beta_coxph"][2, (bi+1):ns], [0.025, 0.975])
-                push!(cr2_coxph, cr2c[1] <= 0.5 <= cr2c[2])
+                    cr1c = quantile(results_dict["beta_coxph"][1, (bi+1):ns], [0.025, 0.975])
+                    push!(cr1_coxph, cr1c[1] <= 0.5 <= cr1c[2])
+                    cr2c = quantile(results_dict["beta_coxph"][2, (bi+1):ns], [0.025, 0.975])
+                    push!(cr2_coxph, cr2c[1] <= 0.5 <= cr2c[2])
+                end
 
                 # IBS entries for all methods
-                push!(df_IBS_summary, (n, g_type, "NonLinear1", results_dict["IBS_nonlinear"]))
-                push!(df_IBS_summary, (n, g_type, "CoxPH", results_dict["IBS_coxph"]))
+                if haskey(results_dict, "IBS_nonlinear")
+                    push!(df_IBS_summary, (n, g_type, "NonLinear1", results_dict["IBS_nonlinear"]))
+                end
+                if haskey(results_dict, "IBS_coxph")
+                    push!(df_IBS_summary, (n, g_type, "CoxPH", results_dict["IBS_coxph"]))
+                end
                 if haskey(results_dict, "IBS_nonlinear_dirichlet")
                     push!(df_IBS_summary, (n, g_type, "NonLinear2", results_dict["IBS_nonlinear_dirichlet"]))
                 end
             end
 
-            if !isempty(betas_nonlinear_mat)
+            if !isempty(betas_nonlinear_mat) || !isempty(betas_nonlinear_dir_mat) || !isempty(betas_coxph_mat)
                 # NonLinear1 (Default Prior) summary
-                push!(df_summary, (
-                    g_type, n, "NonLinear1",
-                    mean(betas_nonlinear_mat) - 0.5,
-                    mean(betas_se_nonlinear_mat),
-                    std(betas_nonlinear_mat),
-                    mean(cr1_nonlinear),
-                    mean((betas_nonlinear_mat .- 0.5) .^ 2),
-                    mean(betas_nonlinear_mat2) - 0.5,
-                    mean(betas_se_nonlinear_mat2),
-                    std(betas_nonlinear_mat2),
-                    mean(cr2_nonlinear),
-                    mean((betas_nonlinear_mat2 .- 0.5) .^ 2),
-                    mean(H_nonlinear),
-                    mean(K_nonlinear),
-                ))
+                if !isempty(betas_nonlinear_mat)
+                    push!(df_summary, (
+                        g_type, n, "NonLinear1",
+                        mean(betas_nonlinear_mat) - 0.5,
+                        mean(betas_se_nonlinear_mat),
+                        std(betas_nonlinear_mat),
+                        mean(cr1_nonlinear),
+                        mean((betas_nonlinear_mat .- 0.5) .^ 2),
+                        mean(betas_nonlinear_mat2) - 0.5,
+                        mean(betas_se_nonlinear_mat2),
+                        std(betas_nonlinear_mat2),
+                        mean(cr2_nonlinear),
+                        mean((betas_nonlinear_mat2 .- 0.5) .^ 2),
+                        mean(H_nonlinear),
+                        mean(K_nonlinear),
+                    ))
+                end
 
                 # NonLinear2 (Dirichlet-Gamma Prior) summary
                 if !isempty(betas_nonlinear_dir_mat)
@@ -456,21 +732,23 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                 end
 
                 # CoxPH summary
-                push!(df_summary, (
-                    g_type, n, "CoxPH",
-                    mean(betas_coxph_mat) - 0.5,
-                    mean(betas_se_coxph_mat),
-                    std(betas_coxph_mat),
-                    mean(cr1_coxph),
-                    mean((betas_coxph_mat .- 0.5) .^ 2),
-                    mean(betas_coxph_mat2) - 0.5,
-                    mean(betas_se_coxph_mat2),
-                    std(betas_coxph_mat2),
-                    mean(cr2_coxph),
-                    mean((betas_coxph_mat2 .- 0.5) .^ 2),
-                    mean(H_coxph),
-                    0.0,
-                ))
+                if !isempty(betas_coxph_mat)
+                    push!(df_summary, (
+                        g_type, n, "CoxPH",
+                        mean(betas_coxph_mat) - 0.5,
+                        mean(betas_se_coxph_mat),
+                        std(betas_coxph_mat),
+                        mean(cr1_coxph),
+                        mean((betas_coxph_mat .- 0.5) .^ 2),
+                        mean(betas_coxph_mat2) - 0.5,
+                        mean(betas_se_coxph_mat2),
+                        std(betas_coxph_mat2),
+                        mean(cr2_coxph),
+                        mean((betas_coxph_mat2 .- 0.5) .^ 2),
+                        mean(H_coxph),
+                        0.0,
+                    ))
+                end
 
                 # --- Plotting (PDF) ---
                 z_grid = cfg.z_grid
@@ -567,8 +845,12 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                 close(file)
 
                 # NonLinear1 (Default Prior)
-                push!(lam_non1_list, data["Lambda_nonlinear"])
-                push!(g_non1_list, data["g_nonlinear"])
+                if haskey(data, "Lambda_nonlinear")
+                    push!(lam_non1_list, data["Lambda_nonlinear"])
+                end
+                if haskey(data, "g_nonlinear")
+                    push!(g_non1_list, data["g_nonlinear"])
+                end
                 
                 # NonLinear2 (Dirichlet-Gamma Prior)
                 if haskey(data, "Lambda_nonlinear_dirichlet")
@@ -628,8 +910,8 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
     # Figures for each g_type
     for g_type in cfg.g_types
         # Collect available n values for this g_type
-        available_n_lam = [n for n in cfg.n_values if haskey(lam_non1_means, (g_type, n))]
-        available_n_g = [n for n in cfg.n_values if haskey(g_non1_means, (g_type, n))]
+        available_n_lam = [n for n in cfg.n_values if haskey(lam_non1_means, (g_type, n)) || haskey(lam_non2_means, (g_type, n))]
+        available_n_g = [n for n in cfg.n_values if haskey(g_non1_means, (g_type, n)) || haskey(g_non2_means, (g_type, n))]
         
         # Λ panels - compare NonLinear1 and NonLinear2
         if !isempty(available_n_lam)
@@ -637,10 +919,13 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
             lam_layout = (1, n_lam_count)
             p_lam = plot(layout=lam_layout, size=(600 * n_lam_count, 400), legend=true)
             for (i, n) in enumerate(available_n_lam)
-                lam_non1 = lam_non1_means[(g_type, n)]
-                # Handle NaN values
-                lam_non1_clean = [isnan(x) ? missing : x for x in lam_non1]
-                lam_non1_avg = [ismissing(x) ? 0.0 : x for x in lam_non1_clean]
+                has_non1 = haskey(lam_non1_means, (g_type, n))
+                if has_non1
+                    lam_non1 = lam_non1_means[(g_type, n)]
+                    # Handle NaN values
+                    lam_non1_clean = [isnan(x) ? missing : x for x in lam_non1]
+                    lam_non1_avg = [ismissing(x) ? 0.0 : x for x in lam_non1_clean]
+                end
                 
                 # Check if NonLinear2 data exists
                 has_non2 = haskey(lam_non2_means, (g_type, n))
@@ -660,7 +945,9 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                           xguidefontsize=14,
                           yguidefontsize=14,
                           legend=:topleft)
-                    plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
+                    if has_non1
+                        plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
+                    end
                     if has_non2
                         plot!(p_lam[i], cfg.t_grid, lam_non2_avg, label="NonLinear2", color=:green, lw=2, linestyle=:dash)
                     end
@@ -672,7 +959,9 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                           tickfontsize=12,
                           xguidefontsize=14,
                           yguidefontsize=14)
-                    plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
+                    if has_non1
+                        plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
+                    end
                     if has_non2
                         plot!(p_lam[i], cfg.t_grid, lam_non2_avg, label="", color=:green, lw=2, linestyle=:dash)
                     end
@@ -691,10 +980,13 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
             p_g = plot(layout=g_layout, size=(600 * n_g_count, 400), legend=true)
             g_true = g_true_values(g_type, cfg.z_grid)
             for (i, n) in enumerate(available_n_g)
-                g_non1 = g_non1_means[(g_type, n)]
-                # Handle NaN values
-                g_non1_clean = [isnan(x) ? missing : x for x in g_non1]
-                g_non1_avg = [ismissing(x) ? 0.0 : x for x in g_non1_clean]
+                has_non1 = haskey(g_non1_means, (g_type, n))
+                if has_non1
+                    g_non1 = g_non1_means[(g_type, n)]
+                    # Handle NaN values
+                    g_non1_clean = [isnan(x) ? missing : x for x in g_non1]
+                    g_non1_avg = [ismissing(x) ? 0.0 : x for x in g_non1_clean]
+                end
                 
                 # Check if NonLinear2 data exists
                 has_non2 = haskey(g_non2_means, (g_type, n))
@@ -716,7 +1008,9 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                           xguidefontsize=14,
                           yguidefontsize=14,
                           legend=legend_pos_g)
-                    plot!(p_g[i], cfg.z_grid, g_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
+                    if has_non1
+                        plot!(p_g[i], cfg.z_grid, g_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
+                    end
                     if has_non2
                         plot!(p_g[i], cfg.z_grid, g_non2_avg, label="NonLinear2", color=:green, lw=2, linestyle=:dash)
                     end
@@ -727,7 +1021,9 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                           tickfontsize=12,
                           xguidefontsize=14,
                           yguidefontsize=14)
-                    plot!(p_g[i], cfg.z_grid, g_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
+                    if has_non1
+                        plot!(p_g[i], cfg.z_grid, g_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
+                    end
                     if has_non2
                         plot!(p_g[i], cfg.z_grid, g_non2_avg, label="", color=:green, lw=2, linestyle=:dash)
                     end
@@ -790,7 +1086,7 @@ end
 
 # CLI entry point.
 function main()
-    mode, reset, replot, plot_only, workers = parse_args()
+    mode, reset, replot, plot_only, workers, methods_to_run, rerun_methods = parse_args()
     
     # If --plot-only is set, only generate plots without running simulations
     if plot_only
@@ -838,53 +1134,102 @@ function main()
     
     # Warn if user requested more workers than available threads
     if cfg.n_workers > nthreads()
-        println("⚠️  Warning: Requested $(cfg.n_workers) workers but Julia was started with only $(nthreads()) thread(s).")
+        println("Warning: Requested $(cfg.n_workers) workers but Julia was started with only $(nthreads()) thread(s).")
         println("   To use more threads, restart Julia with: JULIA_NUM_THREADS=$(cfg.n_workers) julia simulation.jl ...")
         println("   Or on Windows PowerShell: \$env:JULIA_NUM_THREADS=$(cfg.n_workers); julia simulation.jl ...")
         println("   Proceeding with $(n_active_threads) thread(s)...")
         println()
     end
     
-    println("Running simulations with $n_active_threads threads.")
-    prog = Progress(length(tasks); desc="Simulations")
-    progress_lock = ReentrantLock()
+    # Display methods being run
+    method_names = String[]
+    if :nonlinear1 in methods_to_run
+        push!(method_names, "NonLinear1")
+    end
+    if :nonlinear2 in methods_to_run
+        push!(method_names, "NonLinear2")
+    end
+    if :coxph in methods_to_run
+        push!(method_names, "CoxPH")
+    end
+    methods_str = isempty(method_names) ? "None" : join(method_names, ", ")
+    
+    println("=" ^ 80)
+    println("Starting Simulation: $(string(cfg.mode))")
+    println("  Scenario: g_type ∈ $(cfg.g_types), n ∈ $(cfg.n_values), replications = $(cfg.replications)")
+    println("  Methods: $(methods_str)")
+    println("  Workers: $(n_active_threads) thread(s)")
+    println("=" ^ 80)
+    println()
+    
     limit = max(1, min(cfg.n_workers, nthreads()))
     sem = Base.Semaphore(limit)
 
-    # Execute tasks in order: first all linear, then all quad, then all sin
-    # Within each g_type, execute by n_values, then by replication index in order
-    # Replications are still executed in parallel within each (g_type, n) combination for efficiency
+    # Task-level progress bar via ProgressMeter.
+    # Update on task completion; lock avoids interleaved progress output across threads.
+    progress = Progress(length(tasks); desc="Simulations", dt=0.5)
+    progress_lock = ReentrantLock()
+
+    # Execute tasks grouped by (g_type, n), with parallel replications within each group
+    println("\nStarting task execution...")
+    
     for g_type in cfg.g_types
-        println("Processing g_type: $(g_type)")
+        println("\n" * "-" ^ 80)
+        println("Processing scenario: g_type = $(g_type)")
+        println("  Methods: $(methods_str)")
+        println("-" ^ 80)
         for n in cfg.n_values
-            println("  Processing n=$(n) for g_type=$(g_type)")
-            # Collect all tasks for this (g_type, n) combination, sorted by replication index
+            # Collect all tasks for this (g_type, n) combination
             tasks_for_gn = [task for task in tasks if task.g_type == g_type && task.n == n]
-            sort!(tasks_for_gn, by=t -> t.idx)  # Ensure tasks are sorted by replication index
+            sort!(tasks_for_gn, by=t -> t.idx)
             
-    @sync begin
+            total_for_scenario = length(tasks_for_gn)
+            println("  Current scenario: g_type = $(g_type), n = $(n)")
+            println("     Total tasks: $(total_for_scenario) replications")
+            println("     Methods: $(methods_str)")
+            
+            # Execute replications in parallel for this (g_type, n) combination
+            @sync begin
                 for task in tasks_for_gn
-            Threads.@spawn begin
-                Base.acquire(sem)
-                try
-                    run_single_task(task, cfg, base_dir)
-                    lock(progress_lock) do
-                        next!(prog)
+                    Threads.@spawn begin
+                        Base.acquire(sem)
+                        try
+                            run_single_task(task, cfg, base_dir, methods_to_run, rerun_methods)
+                        catch e
+                            # Print error details to help debug parallel execution issues
+                            println(stderr, "\n[ERROR Task rep=$(task.idx)] Failed with error:")
+                            println(stderr, "  Scenario: g_type=$(task.g_type), n=$(task.n)")
+                            println(stderr, "  Error: ", e)
+                            println(stderr, "  Stacktrace:")
+                            showerror(stderr, e, catch_backtrace())
+                            println(stderr)
+                            rethrow(e)  # Re-throw to ensure task is marked as failed
+                        finally
+                            Base.release(sem)
+                            lock(progress_lock) do
+                                next!(progress)
+                            end
+                        end
                     end
-                finally
-                    Base.release(sem)
                 end
             end
+            
+            println("  Completed: $(total_for_scenario)/$(total_for_scenario) tasks for g_type=$(g_type), n=$(n)")
         end
-            end
-            println("  Completed n=$(n) for g_type=$(g_type)")
-        end
-        println("Completed g_type: $(g_type)")
+        println("Completed all tasks for g_type = $(g_type)")
     end
+    
+    println("\nAll tasks completed: $(length(tasks))/$(length(tasks))")
 
+    finish!(progress)
+
+    println("Summarizing results...")
     summarize_tasks(cfg, base_dir)
+    println("Generating plots...")
     generate_manuscript_plots(cfg, base_dir)
     println("Simulation finished. Results saved to $(base_dir)")
 end
 
-main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
