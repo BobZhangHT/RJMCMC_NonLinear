@@ -614,10 +614,10 @@ function RJMCMC_Nonlinear(
                                         gammas_star,
                                         a,b,zetas,xis) + 
                        log(2*H+3) + log(2*H+2) + log(tau_star-taus_star[h]) + log(taus_star[h+1]-tau_star) + 
-                       log(pdf(Normal(gammas_star[h], sigma_gamma_star), gamma_star)) +
-                       log(pdf(Normal(gamma_star, sigma_gamma_star), gammas_star[h+1])) -
+                       logpdf_normal(gamma_star, gammas_star[h], sigma_gamma_star) +
+                       logpdf_normal(gammas_star[h+1], gamma_star, sigma_gamma_star) -
                        2*log(tau) - log(taus_star[h+1] - taus_star[h]) - 
-                       log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
+                       logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
                        log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
                 
                 acc_BM_prob = min(1, exp(log_a_BM))
@@ -1403,9 +1403,9 @@ function RJMCMC_Nonlinear_Dirichlet(
                 log_a_BM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star_add[2:(H_star+1)], gammas_star_add, a,b,zetas,xis) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis) +
                            log_prior_ratio +
-                           log(pdf(Normal(gammas_star[h], sigma_gamma_star), gamma_star)) +
-                           log(pdf(Normal(gamma_star, sigma_gamma_star), gammas_star[h+1])) -
-                           log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
+                           logpdf_normal(gamma_star, gammas_star[h], sigma_gamma_star) +
+                           logpdf_normal(gammas_star[h+1], gamma_star, sigma_gamma_star) -
+                           logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
                            log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
                 
                 acc_BM_prob = min(1, exp(log_a_BM))
@@ -1451,9 +1451,9 @@ function RJMCMC_Nonlinear_Dirichlet(
                 log_a_DM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star_rm[2:(H_star+1)], gammas_star_rm, a,b,zetas,xis) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis) +
                            log_prior_ratio +
-                           log(pdf(Normal(gammas_star_rm[h], sigma_gamma_star), gammas_star_rm[h+1])) - 
-                           log(pdf(Normal(gammas_star[h+1], sigma_gamma_star), gammas_star[h+2])) -
-                           log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
+                           logpdf_normal(gammas_star_rm[h+1], gammas_star_rm[h], sigma_gamma_star) - 
+                           logpdf_normal(gammas_star[h+2], gammas_star[h+1], sigma_gamma_star) -
+                           logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
                            log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
         
                 acc_DM_prob = min(1, exp(log_a_DM))
@@ -1668,9 +1668,9 @@ function RJMCMC_Nonlinear_Dirichlet(
                 log_a_BM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star_add[2:(K_star+1)], xis_star_add) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star[2:(K+1)], xis_star) +
                            log_prior_ratio +
-                           log(pdf(Normal(xis_star[k], sigma_xi_star), xi_star)) +
-                           log(pdf(Normal(xi_star, sigma_xi_star), xis_star[k+1])) - 
-                           log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
+                           logpdf_normal(xi_star, xis_star[k], sigma_xi_star) +
+                           logpdf_normal(xis_star[k+1], xi_star, sigma_xi_star) - 
+                           logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
                            log((1-r_KB)/(K+1)) - log(r_KB_star/(b-a)) - log(U*(1-U)) + log(mu_K) - log(K+1)
                 
                 acc_BM_prob = min(1, exp(log_a_BM))
@@ -1716,9 +1716,9 @@ function RJMCMC_Nonlinear_Dirichlet(
                 log_a_DM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star_rm[2:(K_star+1)], xis_star_rm) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star[2:(K+1)], xis_star) +
                            log_prior_ratio +
-                           log(pdf(Normal(xis_star_rm[k], sigma_xi_star), xis_star_rm[k+1])) - 
-                           log(pdf(Normal(xis_star[k+1], sigma_xi_star), xis_star[k+2])) -
-                           log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
+                           logpdf_normal(xis_star_rm[k+1], xis_star_rm[k], sigma_xi_star) - 
+                           logpdf_normal(xis_star[k+2], xis_star[k+1], sigma_xi_star) -
+                           logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
                            log(r_KB/(b-a)) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
                 
                 acc_DM_prob = min(1, exp(log_a_DM))
@@ -2025,34 +2025,47 @@ function RJMCMC_CoxPH(
         agamma_vec = zeros(size(gammas)[1])
         sigma_gamma = sigmas_gamma_all[iter-1]
         
+        # Pre-compute components that don't change during gamma updates
+        mul!(ws.eta, X, betas)
+        
         for h in 1:(H+2)       
-            # compute the denominator
-            log_prob_de = log(pdf(Normal(0,5), gammas_star[1]))
-            for hh in 2:(H+2)
-                log_prob_de += log(pdf(Normal(gammas_star[hh-1], sigma_gamma), gammas_star[hh]))
+            # compute the denominator - use optimized logpdf_normal
+            log_prob_de = logpdf_normal(gammas_star[1], 0.0, 5.0)
+            @inbounds for hh in 2:(H+2)
+                log_prob_de += logpdf_normal(gammas_star[hh], gammas_star[hh-1], sigma_gamma)
             end
-            log_de = log_prob_de + coxph_loglkh_cal(ws, X,Delta,Y, 
-                                                    betas,
-                                                    tau,taus,gammas_star)
+            
+            # Compute loglambda and Lambda for current gammas
+            loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
+            Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
+            log_de = log_prob_de + sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
+                                       ws.Lambda_values .* exp.(ws.eta))
             
             # compute the numerator
             # propose a new gamma
-            gammas_star[h] = rand(Uniform(gammas[h]-c_gamma, gammas[h]+c_gamma))
-            log_prob_num = log(pdf(Normal(0,5), gammas_star[1]))
-            for hh in 2:(H+2)
-                log_prob_num += log(pdf(Normal(gammas_star[hh-1], sigma_gamma), gammas_star[hh]))
+            gamma_h_new = rand(Uniform(gammas[h]-c_gamma, gammas[h]+c_gamma))
+            gammas_star[h] = gamma_h_new
+            
+            log_prob_num = logpdf_normal(gammas_star[1], 0.0, 5.0)
+            @inbounds for hh in 2:(H+2)
+                log_prob_num += logpdf_normal(gammas_star[hh], gammas_star[hh-1], sigma_gamma)
             end
-            log_num = log_prob_num + coxph_loglkh_cal(ws, X,Delta,Y, 
-                                                    betas,
-                                                    tau,taus,gammas_star)
+            
+            # Recompute loglambda and Lambda for proposed gammas
+            loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
+            Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
+            log_num = log_prob_num + sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
+                                         ws.Lambda_values .* exp.(ws.eta))
             
             # acceptance ratio
             aratio = exp(log_num - log_de)
             acc_prob = min(1, aratio)
             # accept or not
             agamma_vec[h] = acc = rand() < acc_prob
-            # update the gammas
-            gammas_star[h] = acc * gammas_star[h] + (1-acc) * gammas[h]
+            if !acc
+                # Revert the change
+                gammas_star[h] = gammas[h]
+            end
         end
         
         # update the acceptance vector
@@ -2256,31 +2269,43 @@ function RJMCMC_CoxPH(
         betas_star = copy(betas)
         abeta_vec = zeros(size(betas)[1])
         
+        # Pre-compute baseline components that don't change during beta updates
+        mul!(ws.eta, X, betas_star)
+        loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas, ws.knots_h)
+        Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas, ws.knots_h, ws.cumhaz_h)
+        
         for j in 1:dim_beta
-            # compute the denominator
-            log_de = coxph_loglkh_cal(ws, X,Delta,Y, 
-                                        betas_star,
-                                        tau,
-                                        taus, 
-                                        gammas)
+            # compute the denominator (current state)
+            log_de = sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
+                        ws.Lambda_values .* exp.(ws.eta))
             
-            # compute the numerator
-            # propose a new beta
-            betas_star[j] = rand(Uniform(betas[j]-c_beta, betas[j]+c_beta))
+            # propose a new beta - use betas_star[j] (current state) to match NonLinear1
+            beta_j_new = rand(Uniform(betas_star[j]-c_beta, betas_star[j]+c_beta))
+            
+            # Incremental update: only change Xbeta for beta_j
+            beta_diff = beta_j_new - betas_star[j]
+            @inbounds for i in eachindex(ws.eta)
+                ws.eta[i] += X[i, j] * beta_diff
+            end
     
-            log_num = coxph_loglkh_cal(ws, X,Delta,Y, 
-                                    betas_star,
-                                    tau,
-                                    taus, 
-                                    gammas)
+            # compute the numerator (proposed state)
+            log_num = sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
+                         ws.Lambda_values .* exp.(ws.eta))
             
             # acceptance ratio
             aratio = exp(log_num - log_de)
             acc_prob = min(1, aratio)
             # accept or not
             abeta_vec[j] = acc = rand() < acc_prob
-            # update the betas
-            betas_star[j] = acc * betas_star[j] + (1-acc) * betas[j]
+            if !acc
+                # Revert the change
+                @inbounds for i in eachindex(ws.eta)
+                    ws.eta[i] -= X[i, j] * beta_diff
+                end
+                betas_star[j] = betas[j]
+            else
+                betas_star[j] = beta_j_new
+            end
         end
         
         # update the coefficients
