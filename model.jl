@@ -29,34 +29,31 @@ const DEFAULT_BURN_IN = DEFAULT_NS ÷ 2
 const DEFAULT_HMAX = 10
 const DEFAULT_KMAX = 10
 
+# Numerically stable MH accept/reject using log acceptance ratio.
+@inline function mh_accept(log_ratio::Real)
+    return log(rand()) < min(0.0, log_ratio)
+end
+
 # Piecewise log-baseline hazard evaluated at times t given knot locations taus and slopes gammas.
 function loglambda_fun_est(t, tau, taus, gammas)
     taus_ = [0 taus' tau][1,:]
     H = size(taus)[1]
-    if H==0
-        return (gammas[1] .+ (gammas[2] .- gammas[1]) .* (t' .- taus_[1]) ./ (taus_[2] - taus_[1]))'
-    else
     inds = taus_[2:(H+2)] .>= t' .> taus_[1:(H+1)]
     values = gammas[1:(H+1)] .+ (t' .- taus_[1:(H+1)]) .* 
             (gammas[2:(H+2)] .- gammas[1:(H+1)]) ./ 
             (taus_[2:(H+2)] - taus_[1:(H+1)])
     return sum(values .* inds, dims=1)[1,:]
-    end
 end
 
 # Piecewise-linear nonlinear covariate effect g(z) over [a, b].
 function g_fun_est(z, a, b, zetas, xis)
     zetas_ = [a zetas' b][1,:]
     K = size(zetas)[1]
-    if K==0
-        return (xis[1] .+ (xis[2] .- xis[1]) .* (z' .- zetas_[1]) ./ (zetas_[2] - zetas_[1]))'
-    else
     inds = zetas_[2:(K+2)] .>= z' .> zetas_[1:(K+1)]
     values = xis[1:(K+1)] .+ (z' .- zetas_[1:(K+1)]) .* 
             (xis[2:(K+2)] .- xis[1:(K+1)]) ./ 
             (zetas_[2:(K+2)] - zetas_[1:(K+1)])
     return sum(values .* inds, dims=1)[1,:]
-    end
 end
 
 # Integrated hazard Λ(t) corresponding to the piecewise log-λ definition.
@@ -65,11 +62,37 @@ function Lambda_fun_est(t, tau, taus, gammas)
     t = ifelse.(t .> tau, tau, t)
     taus_ = [0 taus' tau][1,:]
     H = size(taus)[1]
-    lambda_mat = exp.(gammas[1:(H+1)] .+ (gammas[2:(H+2)] .- gammas[1:(H+1)]) .* 
-                     ((t' .- taus_[1:(H+1)]) ./ (taus_[2:(H+2)] .- taus_[1:(H+1)])))
-    part1 = (taus_[2:(H+2)] .- taus_[1:(H+1)]) ./ (gammas[2:(H+2)] .- gammas[1:(H+1)]) .* (lambda_mat .- exp.(gammas[1:(H+1)])) 
-    part2 = [0 cumsum((taus_[2:(H+1)] .- taus_[1:(H)])' ./ (gammas[2:(H+1)] .- gammas[1:(H)])' .*
-            (exp.(gammas[2:(H+1)]) .- exp.(gammas[1:(H)]))', dims=2)]'
+    delta_tau = taus_[2:(H+2)] .- taus_[1:(H+1)]
+    delta_gamma = gammas[2:(H+2)] .- gammas[1:(H+1)]
+
+    s_mat = (t' .- taus_[1:(H+1)]) ./ delta_tau
+    # part1(i,t) = ∫ exp(linear logλ) on segment i up to t, with stable handling when Δγ≈0.
+    exp_gamma0 = exp.(gammas[1:(H+1)])
+    part1 = similar(s_mat)
+    small = abs.(delta_gamma) .< 1e-10
+    if any(small)
+        # For small Δγ, integral ≈ exp(γ0) * (t - τ0)
+        for i in 1:(H+1)
+            if small[i]
+                part1[i, :] .= exp_gamma0[i] .* (t' .- taus_[i])
+            else
+                part1[i, :] .= exp_gamma0[i] .* delta_tau[i] .* (expm1.(delta_gamma[i] .* s_mat[i, :]) ./ delta_gamma[i])
+            end
+        end
+    else
+        part1 .= exp_gamma0 .* delta_tau .* (expm1.(delta_gamma .* s_mat) ./ delta_gamma)
+    end
+
+    # Cumulative integral over full segments before each knot (stable Δγ≈0 limit).
+    full_seg = similar(delta_gamma)
+    for i in 1:(H+1)
+        if abs(delta_gamma[i]) < 1e-10
+            full_seg[i] = exp_gamma0[i] * delta_tau[i]
+        else
+            full_seg[i] = exp_gamma0[i] * delta_tau[i] * (expm1(delta_gamma[i]) / delta_gamma[i])
+        end
+    end
+    part2 = reshape([0.0; cumsum(full_seg[1:H])], :, 1)
     inds = taus_[2:(H+2)] .>= t' .> taus_[1:(H+1)]    
     return sum((part1 .+ part2) .* inds, dims=1)[1,:]
 end
@@ -259,11 +282,9 @@ function RJMCMC_Nonlinear(
                                                 tau,taus,gammas_star,
                                                 a,b,zetas,xis)
             
-            # acceptance ratio
-            aratio = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            # accept or not
-            agamma_vec[h] = acc = rand() < acc_prob
+            # acceptance (log-scale for numerical stability)
+            log_ratio = log_num - log_de
+            agamma_vec[h] = acc = mh_accept(log_ratio)
             # update the gammas
             gammas_star[h] = acc * gammas_star[h] + (1-acc) * gammas[h]
         end
@@ -304,10 +325,8 @@ function RJMCMC_Nonlinear(
                                         a,b,zetas,xis) + 
                             log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc])
                     
-             aratio = exp(log_num - log_de)
-             acc_prob = min(1, aratio)
-             # accept or not
-             acc = rand() < acc_prob
+             log_ratio = log_num - log_de
+             acc = mh_accept(log_ratio)
              # update the taus
              taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1] 
         end
@@ -365,10 +384,8 @@ function RJMCMC_Nonlinear(
                        log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
                        log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
                 
-                acc_BM_prob = min(1, exp(log_a_BM))
-                
-                # accept or not for the Metropolis-Hastings' Move
-                acc_MHM = rand() < acc_BM_prob
+                # accept or not for the Metropolis-Hastings' Move (log-scale for stability)
+                acc_MHM = mh_accept(log_a_BM)
                 
                 # update the coefficients
                 if acc_MHM
@@ -409,7 +426,7 @@ function RJMCMC_Nonlinear(
 				# update the calculation of U 1206
 				A_hp1 = (gammas_star[h+2]-gammas_star[h+1])/(taus_star[h+2]-taus_star[h+1])
 				A_h = (gammas_star[h+1]-gammas_star[h])/(taus_star[h+1]-taus_star[h])
-				U = exp(A_h)/(exp(A_h)+exp(A_hp1))
+				U = 1 / (1 + exp(A_hp1 - A_h))
                 
                 # logarithmic 
                 log_a_DM = loglkh_cal(X,Z,Delta,Y, 
@@ -432,10 +449,8 @@ function RJMCMC_Nonlinear(
                        log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
                        log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
         
-                acc_DM_prob = min(1, exp(log_a_DM))
-                
-                # accept or not for the Metropolis-Hastings' Move
-                acc_MHM = rand() < acc_DM_prob
+                # accept or not for the Metropolis-Hastings' Move (log-scale for stability)
+                acc_MHM = mh_accept(log_a_DM)
             
                 # update the coefficients
                 if acc_MHM
@@ -494,11 +509,9 @@ function RJMCMC_Nonlinear(
                                 gammas,
                                 a,b,zetas,xis)
             
-            # acceptance ratio
-            aratio   = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            # accept or not
-            abeta_vec[j] = acc = rand() < acc_prob
+            # acceptance (log-scale for numerical stability)
+            log_ratio = log_num - log_de
+            abeta_vec[j] = acc = mh_accept(log_ratio)
             # update the betas
             betas_star[j] = acc * betas_star[j] + (1-acc) * betas[j]
         end
@@ -538,11 +551,9 @@ function RJMCMC_Nonlinear(
                                                 tau,taus,gammas,
                                                 a,b,zetas,xis_star)
             
-            # acceptance ratio
-            aratio = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            # accept or not
-            axi_vec[k] = acc = rand() < acc_prob
+            # acceptance (log-scale for numerical stability)
+            log_ratio = log_num - log_de
+            axi_vec[k] = acc = mh_accept(log_ratio)
             # update the xis
             xis_star[k] = acc * xis_star[k] + (1-acc) * xis[k]
         end
@@ -587,10 +598,8 @@ function RJMCMC_Nonlinear(
 										xis_star) + 
                             log(zetas_star[kc+2] - zeta_kc_star) + log(zeta_kc_star - zetas_star[kc])
                     
-             aratio = exp(log_num - log_de)
-             acc_prob = min(1, aratio)
-             # accept or not
-             acc = rand() < acc_prob
+             log_ratio = log_num - log_de
+             acc = mh_accept(log_ratio)
              # update the zetas
              zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1] 
         end
@@ -650,10 +659,8 @@ function RJMCMC_Nonlinear(
                        log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
                        log((1-r_KB)/(K+1)) - log(r_KB_star/(b-a)) - log(U*(1-U)) + log(mu_K) - log(K+1)
                 
-                acc_BM_prob = min(1, exp(log_a_BM))
-                
-                # accept or not for the Metropolis-Hastings' Move
-                acc_MHM = rand() < acc_BM_prob
+                # accept or not for the Metropolis-Hastings' Move (log-scale for stability)
+                acc_MHM = mh_accept(log_a_BM)
                 # acc_MHM = false
             
                 # update the coefficients
@@ -696,7 +703,7 @@ function RJMCMC_Nonlinear(
                 # update the calculation of U 1206
 				A_hp1 = (xis_star[k+2]-xis_star[k+1])/(zetas_star[k+2]-zetas_star[k+1])
 				A_h = (xis_star[k+1]-xis_star[k])/(zetas_star[k+1]-zetas_star[k])
-				U = exp(A_h)/(exp(A_h)+exp(A_hp1))
+				U = 1 / (1 + exp(A_hp1 - A_h))
                 
                 # logarithmic 
                 log_a_DM = loglkh_cal(X,Z,Delta,Y, 
@@ -718,10 +725,8 @@ function RJMCMC_Nonlinear(
                            log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
                            log(r_KB/(b-a)) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
                 
-                acc_DM_prob = min(1, exp(log_a_DM))
-                
-                # accept or not for the Metropolis-Hastings' Move
-                acc_MHM = rand() < acc_DM_prob
+                # accept or not for the Metropolis-Hastings' Move (log-scale for stability)
+                acc_MHM = mh_accept(log_a_DM)
                 # acc_MHM = false
             
                 # update the coefficients
@@ -996,9 +1001,8 @@ function RJMCMC_Nonlinear_Dirichlet(
             end
             log_num = log_prob_num + loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas_star, a,b,zetas,xis)
             
-            aratio = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            agamma_vec[h] = acc = rand() < acc_prob
+            log_ratio = log_num - log_de
+            agamma_vec[h] = acc = mh_accept(log_ratio)
             gammas_star[h] = acc * gammas_star[h] + (1-acc) * gammas[h]
         end
         
@@ -1030,9 +1034,7 @@ function RJMCMC_Nonlinear_Dirichlet(
             
             log_ratio = (log_lik_num - log_lik_de) + (log_prior_num - log_prior_de)
             
-            aratio = exp(log_ratio)
-            acc_prob = min(1, aratio)
-            acc = rand() < acc_prob
+            acc = mh_accept(log_ratio)
             taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1]
         end
         
@@ -1076,8 +1078,7 @@ function RJMCMC_Nonlinear_Dirichlet(
                            log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
                            log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
                 
-                acc_BM_prob = min(1, exp(log_a_BM))
-                acc_MHM = rand() < acc_BM_prob
+                acc_MHM = mh_accept(log_a_BM)
                 
                 if acc_MHM
                     H_all[iter] = H_star
@@ -1106,7 +1107,7 @@ function RJMCMC_Nonlinear_Dirichlet(
 
                 A_hp1 = (gammas_star[h+2]-gammas_star[h+1])/(taus_star[h+2]-taus_star[h+1])
                 A_h = (gammas_star[h+1]-gammas_star[h])/(taus_star[h+1]-taus_star[h])
-                U = exp(A_h)/(exp(A_h)+exp(A_hp1))
+                U = 1 / (1 + exp(A_hp1 - A_h))
                 
                 # Dirichlet prior ratio for death (Eq. 5)
                 Delta_j_old = taus_star[h+1] - taus_star[h]
@@ -1124,8 +1125,7 @@ function RJMCMC_Nonlinear_Dirichlet(
                            log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
                            log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
         
-                acc_DM_prob = min(1, exp(log_a_DM))
-                acc_MHM = rand() < acc_DM_prob
+                acc_MHM = mh_accept(log_a_DM)
             
                 if acc_MHM
                     H_all[iter] = H_star
@@ -1165,9 +1165,8 @@ function RJMCMC_Nonlinear_Dirichlet(
             betas_star[j] = rand(Uniform(betas[j]-c_beta, betas[j]+c_beta))
             log_num = loglkh_cal(X,Z,Delta,Y, betas_star, tau, taus, gammas, a,b,zetas,xis)
             
-            aratio = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            abeta_vec[j] = acc = rand() < acc_prob
+            log_ratio = log_num - log_de
+            abeta_vec[j] = acc = mh_accept(log_ratio)
             betas_star[j] = acc * betas_star[j] + (1-acc) * betas[j]
         end
         
@@ -1194,9 +1193,8 @@ function RJMCMC_Nonlinear_Dirichlet(
             end
             log_num = log_prob_num + loglkh_cal(X,Z,Delta,Y, betas, tau,taus,gammas, a,b,zetas,xis_star)
             
-            aratio = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            axi_vec[k] = acc = rand() < acc_prob
+            log_ratio = log_num - log_de
+            axi_vec[k] = acc = mh_accept(log_ratio)
             xis_star[k] = acc * xis_star[k] + (1-acc) * xis[k]
         end
         
@@ -1228,9 +1226,7 @@ function RJMCMC_Nonlinear_Dirichlet(
             
             log_ratio = (log_lik_num - log_lik_de) + (log_prior_num - log_prior_de)
             
-            aratio = exp(log_ratio)
-            acc_prob = min(1, aratio)
-            acc = rand() < acc_prob
+            acc = mh_accept(log_ratio)
             zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1]
         end
     
@@ -1274,8 +1270,7 @@ function RJMCMC_Nonlinear_Dirichlet(
                            log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
                            log((1-r_KB)/(K+1)) - log(r_KB_star/(b-a)) - log(U*(1-U)) + log(mu_K) - log(K+1)
                 
-                acc_BM_prob = min(1, exp(log_a_BM))
-                acc_MHM = rand() < acc_BM_prob
+                acc_MHM = mh_accept(log_a_BM)
             
                 if acc_MHM
                     K_all[iter] = K_star
@@ -1304,7 +1299,7 @@ function RJMCMC_Nonlinear_Dirichlet(
 
                 A_kp1 = (xis_star[k+2]-xis_star[k+1])/(zetas_star[k+2]-zetas_star[k+1])
                 A_k = (xis_star[k+1]-xis_star[k])/(zetas_star[k+1]-zetas_star[k])
-                U = exp(A_k)/(exp(A_k)+exp(A_kp1))
+                U = 1 / (1 + exp(A_kp1 - A_k))
                 
                 # Dirichlet prior ratio for death
                 Delta_k_old = zetas_star[k+1] - zetas_star[k]
@@ -1322,8 +1317,7 @@ function RJMCMC_Nonlinear_Dirichlet(
                            log(pdf(Normal(xis_star[k], sigma_xi_star), xis_star[k+1])) +
                            log(r_KB/(b-a)) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
                 
-                acc_DM_prob = min(1, exp(log_a_DM))
-                acc_MHM = rand() < acc_DM_prob
+                acc_MHM = mh_accept(log_a_DM)
             
                 if acc_MHM
                     K_all[iter] = K_star
@@ -1376,7 +1370,7 @@ function RJMCMC_Nonlinear_Dirichlet(
                           (alpha_tau_star - alpha_tau) * S_tau +
                           (log_alpha_tau_star - log_alpha_tau)  # Jacobian
             
-            if rand() < min(1, exp(log_r_alpha))
+            if mh_accept(log_r_alpha)
                 alpha_tau = alpha_tau_star
             end
         end
@@ -1398,7 +1392,7 @@ function RJMCMC_Nonlinear_Dirichlet(
                           (alpha_zeta_star - alpha_zeta) * S_zeta +
                           (log_alpha_zeta_star - log_alpha_zeta)
             
-            if rand() < min(1, exp(log_r_alpha))
+            if mh_accept(log_r_alpha)
                 alpha_zeta = alpha_zeta_star
             end
         end
@@ -1610,10 +1604,8 @@ function RJMCMC_CoxPH(
                                                     tau,taus,gammas_star)
             
             # acceptance ratio
-            aratio = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            # accept or not
-            agamma_vec[h] = acc = rand() < acc_prob
+            log_ratio = log_num - log_de
+            agamma_vec[h] = acc = mh_accept(log_ratio)
             # update the gammas
             gammas_star[h] = acc * gammas_star[h] + (1-acc) * gammas[h]
         end
@@ -1652,10 +1644,8 @@ function RJMCMC_CoxPH(
 								gammas_star) + 
                             log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc])
                     
-             aratio = exp(log_num - log_de)
-             acc_prob = min(1, aratio)
-             # accept or not
-             acc = rand() < acc_prob
+             log_ratio = log_num - log_de
+             acc = mh_accept(log_ratio)
              # update the taus
              taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1] 
         end
@@ -1712,10 +1702,8 @@ function RJMCMC_CoxPH(
                        log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
                        log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
     
-                acc_BM_prob = min(1, exp(log_a_BM))
-                
-                # accept or not for the Metropolis-Hastings' Move
-                acc_MHM = rand() < acc_BM_prob
+                # accept or not for the Metropolis-Hastings' Move (log-scale for stability)
+                acc_MHM = mh_accept(log_a_BM)
                 # acc_MHM = false
                 
                 # update the coefficients
@@ -1756,7 +1744,7 @@ function RJMCMC_CoxPH(
 
                 A_hp1 = (gammas_star[h+2]-gammas_star[h+1])/(taus_star[h+2]-taus_star[h+1])
 				A_h = (gammas_star[h+1]-gammas_star[h])/(taus_star[h+1]-taus_star[h])
-				U = exp(A_h)/(exp(A_h)+exp(A_hp1))
+				U = 1 / (1 + exp(A_hp1 - A_h))
                 
                 # logarithmic 
                 log_a_DM = coxph_loglkh_cal(X,Delta,Y, 
@@ -1777,10 +1765,8 @@ function RJMCMC_CoxPH(
                        log(pdf(Normal(gammas_star[h], sigma_gamma_star), gammas_star[h+1])) +
                        log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
                 
-                acc_DM_prob = min(1, exp(log_a_DM))
-                
-                # accept or not for the Metropolis-Hastings' Move
-                acc_MHM = rand() < acc_DM_prob
+                # accept or not for the Metropolis-Hastings' Move (log-scale for stability)
+                acc_MHM = mh_accept(log_a_DM)
             
                 # update the coefficients
                 if acc_MHM
@@ -1837,11 +1823,9 @@ function RJMCMC_CoxPH(
                                     taus, 
                                     gammas)
             
-            # acceptance ratio
-            aratio = exp(log_num - log_de)
-            acc_prob = min(1, aratio)
-            # accept or not
-            abeta_vec[j] = acc = rand() < acc_prob
+            # acceptance (log-scale for numerical stability)
+            log_ratio = log_num - log_de
+            abeta_vec[j] = acc = mh_accept(log_ratio)
             # update the betas
             betas_star[j] = acc * betas_star[j] + (1-acc) * betas[j]
         end
