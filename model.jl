@@ -794,6 +794,11 @@ function RJMCMC_Nonlinear(
         end
     
         for k in 2:(K+2)        
+            # Save current state before proposing (needed for rejection case)
+            # This is the value at the start of this iteration, which may have been
+            # updated by previous accepted proposals in this loop
+            xi_k_current = xis_star[k]
+            
             # compute the denominator - use optimized logpdf_normal
             log_prob_de = 0.0
             @inbounds for kk in 2:(K+2)
@@ -804,8 +809,9 @@ function RJMCMC_Nonlinear(
                                       ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
             
             # compute the numerator
-            # propose a new xi
-            xi_k_new = rand(Uniform(xis[k]-c_xi, xis[k]+c_xi))
+            # propose a new xi - use xis_star[k] (current state) not xis[k] (initial state)
+            # This maintains Metropolis-Hastings detailed balance when previous coordinates were accepted
+            xi_k_new = rand(Uniform(xis_star[k]-c_xi, xis_star[k]+c_xi))
             xis_star[k] = xi_k_new
             
             log_prob_num = 0.0
@@ -828,8 +834,8 @@ function RJMCMC_Nonlinear(
             # accept or not
             axi_vec[k] = acc = rand() < acc_prob
             if !acc
-                # Revert the change
-                xis_star[k] = xis[k]
+                # Revert the change - restore to saved current state
+                xis_star[k] = xi_k_current
                 g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
                 @inbounds for i in eachindex(ws.eta)
                     ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
@@ -1548,6 +1554,11 @@ function RJMCMC_Nonlinear_Dirichlet(
         end
     
         for k in 2:(K+2)        
+            # Save current state before proposing (needed for rejection case)
+            # This is the value at the start of this iteration, which may have been
+            # updated by previous accepted proposals in this loop
+            xi_k_current = xis_star[k]
+            
             log_prob_de = 0.0
             @inbounds for kk in 2:(K+2)
                 log_prob_de += logpdf_normal(xis_star[kk], xis_star[kk-1], sigma_xi)
@@ -1556,8 +1567,9 @@ function RJMCMC_Nonlinear_Dirichlet(
             log_de = log_prob_de + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
                                       ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
             
-            # propose a new xi
-            xi_k_new = rand(Uniform(xis[k]-c_xi, xis[k]+c_xi))
+            # propose a new xi - use xis_star[k] (current state) not xis[k] (initial state)
+            # This maintains Metropolis-Hastings detailed balance when previous coordinates were accepted
+            xi_k_new = rand(Uniform(xis_star[k]-c_xi, xis_star[k]+c_xi))
             xis_star[k] = xi_k_new
             
             log_prob_num = 0.0
@@ -1578,8 +1590,8 @@ function RJMCMC_Nonlinear_Dirichlet(
             acc_prob = min(1, aratio)
             axi_vec[k] = acc = rand() < acc_prob
             if !acc
-                # Revert the change
-                xis_star[k] = xis[k]
+                # Revert the change - restore to saved current state
+                xis_star[k] = xi_k_current
                 g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
                 @inbounds for i in eachindex(ws.eta)
                     ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
