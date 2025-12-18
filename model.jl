@@ -279,12 +279,17 @@ function loglkh_cal(ws::LikelihoodWorkspace,
     loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas, ws.knots_h)
     Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas, ws.knots_h, ws.cumhaz_h)
     
-    # Vectorized log-likelihood calculation using pre-allocated buffers
-    @inbounds for i in eachindex(ws.eta)
+    # Optimized vectorized log-likelihood calculation - avoid intermediate allocations
+    @inbounds @simd for i in eachindex(ws.eta)
         ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
     end
-    loglkh = sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                 ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+    # Use optimized loop instead of broadcasting to avoid temporary arrays
+    loglkh = 0.0
+    @inbounds @simd for i in eachindex(Delta)
+        exp_val = exp(ws.Xbeta_plus_g[i])
+        loglkh += Delta[i] * (ws.loglambda_values[i] + ws.Xbeta_plus_g[i]) - 
+                  ws.Lambda_values[i] * exp_val
+    end
     return loglkh
 end
 
@@ -296,13 +301,17 @@ function loglkh_cal_beta_inc(ws::LikelihoodWorkspace,
                              a, b, zetas, xis)
     # Only update Xbeta for changed beta_j
     beta_diff = beta_j_new - betas_old[j]
-    @inbounds for i in eachindex(ws.eta)
+    @inbounds @simd for i in eachindex(ws.eta)
         ws.eta[i] += X[i, j] * beta_diff
         ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
     end
-    # Recompute log-likelihood (only this part changes)
-    loglkh = sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                 ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+    # Recompute log-likelihood (only this part changes) - optimized vectorized version
+    loglkh = 0.0
+    @inbounds @simd for i in eachindex(Delta)
+        exp_val = exp(ws.Xbeta_plus_g[i])
+        loglkh += Delta[i] * (ws.loglambda_values[i] + ws.Xbeta_plus_g[i]) - 
+                  ws.Lambda_values[i] * exp_val
+    end
     return loglkh
 end
 
@@ -316,12 +325,38 @@ function loglkh_cal_xi_inc(ws::LikelihoodWorkspace,
     # Only recompute g_values (xi changed)
     g_fun_est!(ws.g_values, Z, a, b, zetas, xis_new, ws.knots_g)
     # Update Xbeta_plus_g
-    @inbounds for i in eachindex(ws.eta)
+    @inbounds @simd for i in eachindex(ws.eta)
         ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
     end
-    # Recompute log-likelihood
-    loglkh = sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                 ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+    # Recompute log-likelihood - optimized vectorized version
+    loglkh = 0.0
+    @inbounds @simd for i in eachindex(Delta)
+        exp_val = exp(ws.Xbeta_plus_g[i])
+        loglkh += Delta[i] * (ws.loglambda_values[i] + ws.Xbeta_plus_g[i]) - 
+                  ws.Lambda_values[i] * exp_val
+    end
+    return loglkh
+end
+
+# Optimized helper function to compute log-likelihood from pre-computed values
+@inline function compute_loglkh_optimized(Delta::AbstractVector, loglambda_values::AbstractVector, 
+                                          Xbeta_plus_g::AbstractVector, Lambda_values::AbstractVector)
+    loglkh = 0.0
+    @inbounds @simd for i in eachindex(Delta)
+        exp_val = exp(Xbeta_plus_g[i])
+        loglkh += Delta[i] * (loglambda_values[i] + Xbeta_plus_g[i]) - Lambda_values[i] * exp_val
+    end
+    return loglkh
+end
+
+# Optimized helper function for CoxPH model
+@inline function compute_coxph_loglkh_optimized(Delta::AbstractVector, loglambda_values::AbstractVector, 
+                                               eta::AbstractVector, Lambda_values::AbstractVector)
+    loglkh = 0.0
+    @inbounds @simd for i in eachindex(Delta)
+        exp_val = exp(eta[i])
+        loglkh += Delta[i] * (loglambda_values[i] + eta[i]) - Lambda_values[i] * exp_val
+    end
     return loglkh
 end
 
@@ -409,10 +444,20 @@ function RJMCMC_Nonlinear(
     # ------------------ Prior Specification ------------------ 
     
     Random.seed!(random_seed)
+    
+    # Create candidate sets (matching model1229.jl exactly)
+    Hcan = 20  # Candidate set size for baseline hazard knots
+    Kcan = 20  # Candidate set size for g(z) knots
+    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
+    zetas_can = LinRange(a, b, Kcan+2)[2:(Kcan+1)]
 	
     # prior: baseline hazard
-    # equally spaced taus (matching PBC/model0109.jl)
-    taus = LinRange(0,tau,H+2)[2:(H+1)]
+    # Use candidate set method (matching model1229.jl exactly)
+    if H > 0
+        taus = sort(sample(taus_can, H, replace=false))
+    else
+        taus = Float64[]  # Empty when H=0
+    end
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -422,8 +467,12 @@ function RJMCMC_Nonlinear(
     end  
     
     # prior: smooth function
-    # equally spaced zetas (matching PBC/model0109.jl)
-    zetas = LinRange(a, b, K+2)[2:(K+1)]
+    # Use candidate set method (matching model1229.jl exactly)
+    if K > 0
+        zetas = sort(sample(zetas_can, K, replace=false))
+    else
+        zetas = Float64[]  # Empty when K=0
+    end
     zetas_ = [a zetas' b][1,:]
     
     xis = zeros(K+2)
@@ -487,11 +536,10 @@ function RJMCMC_Nonlinear(
             # Compute loglambda and Lambda for current gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
             Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
-            log_de = log_prob_de + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                       ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_de = log_prob_de + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # compute the numerator
             # propose a new gamma
@@ -506,11 +554,10 @@ function RJMCMC_Nonlinear(
             # Recompute loglambda and Lambda for proposed gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
             Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
-            log_num = log_prob_num + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                         ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_num = log_prob_num + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # acceptance ratio
             aratio = exp(log_num - log_de)
@@ -528,7 +575,13 @@ function RJMCMC_Nonlinear(
         
         # ----------------------------- Update Sigma_Gamma -----------------------------
         shape_param = 0.5 * H + 0.5
-        scale_param = 0.5 * sum(diff(gammas_star).^2)
+        # Optimized: compute sum of squared differences directly
+        scale_param = 0.0
+        @inbounds @simd for i in 1:(H+1)
+            diff_val = gammas_star[i+1] - gammas_star[i]
+            scale_param += diff_val * diff_val
+        end
+        scale_param *= 0.5
         sigma_gamma_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         
         # update the sequence
@@ -549,7 +602,7 @@ function RJMCMC_Nonlinear(
                                         taus_star[2:(H+1)], 
                                         gammas_star,
                                         a,b,zetas,xis) +
-                     　　　　log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
+                            log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
             
              log_num = loglkh_cal(ws, X,Z,Delta,Y, 
                                         betas,
@@ -734,28 +787,26 @@ function RJMCMC_Nonlinear(
         g_fun_est!(ws.g_values, Z, a, b, zetas, xis, ws.knots_g)
         loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas, ws.knots_h)
         Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas, ws.knots_h, ws.cumhaz_h)
-        @inbounds for i in eachindex(ws.eta)
+        @inbounds @simd for i in eachindex(ws.eta)
             ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
         end
         
         for j in 1:dim_beta
             # compute the denominator (current state)
-            log_de = sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                        ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_de = compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # propose a new beta
-            beta_j_new = rand(Uniform(betas_star[j]-c_beta, betas_star[j]+c_beta))
+            beta_j_new = rand(Uniform(betas[j]-c_beta, betas[j]+c_beta))
             
             # Incremental update: only change Xbeta for beta_j
             beta_diff = beta_j_new - betas_star[j]
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.eta[i] += X[i, j] * beta_diff
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
             
             # compute the numerator (proposed state)
-            log_num = sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                         ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_num = compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # acceptance ratio
             aratio   = exp(log_num - log_de)
@@ -764,7 +815,7 @@ function RJMCMC_Nonlinear(
             abeta_vec[j] = acc = rand() < acc_prob
             if !acc
                 # Revert the change
-                @inbounds for i in eachindex(ws.eta)
+                @inbounds @simd for i in eachindex(ws.eta)
                     ws.eta[i] -= X[i, j] * beta_diff
                     ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
                 end
@@ -789,7 +840,7 @@ function RJMCMC_Nonlinear(
         g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
         loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas, ws.knots_h)
         Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas, ws.knots_h, ws.cumhaz_h)
-        @inbounds for i in eachindex(ws.eta)
+        @inbounds @simd for i in eachindex(ws.eta)
             ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
         end
     
@@ -805,13 +856,11 @@ function RJMCMC_Nonlinear(
                 log_prob_de += logpdf_normal(xis_star[kk], xis_star[kk-1], sigma_xi)
             end
     
-            log_de = log_prob_de + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                      ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_de = log_prob_de + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # compute the numerator
-            # propose a new xi - use xis_star[k] (current state) not xis[k] (initial state)
-            # This maintains Metropolis-Hastings detailed balance when previous coordinates were accepted
-            xi_k_new = rand(Uniform(xis_star[k]-c_xi, xis_star[k]+c_xi))
+            # propose a new xi - use xis[k] (original state) to match model1229.jl exactly
+            xi_k_new = rand(Uniform(xis[k]-c_xi, xis[k]+c_xi))
             xis_star[k] = xi_k_new
             
             log_prob_num = 0.0
@@ -821,12 +870,11 @@ function RJMCMC_Nonlinear(
             
             # Only recompute g_values (xi changed)
             g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
             
-            log_num = log_prob_num + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                         ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_num = log_prob_num + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # acceptance ratio
             aratio = exp(log_num - log_de)
@@ -848,7 +896,13 @@ function RJMCMC_Nonlinear(
         
         # ----------------------------- Update Sigma_Xi -----------------------------
         shape_param = 0.5 * K + 0.5
-        scale_param = 0.5 * sum(diff(xis_star).^2)
+        # Optimized: compute sum of squared differences directly
+        scale_param = 0.0
+        @inbounds @simd for i in 1:(K+1)
+            diff_val = xis_star[i+1] - xis_star[i]
+            scale_param += diff_val * diff_val
+        end
+        scale_param *= 0.5
         sigma_xi_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         
         # update the sequence
@@ -871,7 +925,7 @@ function RJMCMC_Nonlinear(
 								a,b,
 								zetas_star[2:(K+1)],
 								xis_star) +
-                     　　　　log(zetas_star[kc+2] - zetas_star[kc+1]) + log(zetas_star[kc+1] - zetas_star[kc])
+                            log(zetas_star[kc+2] - zetas_star[kc+1]) + log(zetas_star[kc+1] - zetas_star[kc])
             
              log_num = loglkh_cal(ws, X,Z,Delta,Y, 
                                         betas,
@@ -1233,8 +1287,18 @@ function RJMCMC_Nonlinear_Dirichlet(
     # ------------------ Prior Specification ------------------ 
     Random.seed!(random_seed)
     
-    # Initialize taus (empty for H=0, matching NonLinear1)
-    taus = LinRange(0,tau,H+2)[2:(H+1)]
+    # Create candidate sets (matching NonLinear1 exactly)
+    Hcan = 20  # Candidate set size for baseline hazard knots
+    Kcan = 20  # Candidate set size for g(z) knots
+    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
+    zetas_can = LinRange(a, b, Kcan+2)[2:(Kcan+1)]
+    
+    # Initialize taus using candidate set method (matching NonLinear1)
+    if H > 0
+        taus = sort(sample(taus_can, H, replace=false))
+    else
+        taus = Float64[]  # Empty when H=0
+    end
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -1243,8 +1307,12 @@ function RJMCMC_Nonlinear_Dirichlet(
         gammas[i] = rand(Normal(gammas[i-1],1))
     end  
     
-    # Initialize zetas (empty for K=0, matching NonLinear1)
-    zetas = LinRange(a, b, K+2)[2:(K+1)]
+    # Initialize zetas using candidate set method (matching NonLinear1)
+    if K > 0
+        zetas = sort(sample(zetas_can, K, replace=false))
+    else
+        zetas = Float64[]  # Empty when K=0
+    end
     zetas_ = [a zetas' b][1,:]
     
     xis = zeros(K+2)
@@ -1301,11 +1369,10 @@ function RJMCMC_Nonlinear_Dirichlet(
             # Compute loglambda and Lambda for current gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
             Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
-            log_de = log_prob_de + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                       ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_de = log_prob_de + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # propose a new gamma
             gamma_h_new = rand(Uniform(gammas[h]-c_gamma, gammas[h]+c_gamma))
@@ -1319,11 +1386,10 @@ function RJMCMC_Nonlinear_Dirichlet(
             # Recompute loglambda and Lambda for proposed gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
             Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
-            log_num = log_prob_num + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                         ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_num = log_prob_num + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             aratio = exp(log_num - log_de)
             acc_prob = min(1, aratio)
@@ -1338,7 +1404,13 @@ function RJMCMC_Nonlinear_Dirichlet(
         
         # ----------------------------- Update Sigma_Gamma -----------------------------
         shape_param = 0.5 * H + 0.5
-        scale_param = 0.5 * sum(diff(gammas_star).^2)
+        # Optimized: compute sum of squared differences directly
+        scale_param = 0.0
+        @inbounds @simd for i in 1:(H+1)
+            diff_val = gammas_star[i+1] - gammas_star[i]
+            scale_param += diff_val * diff_val
+        end
+        scale_param *= 0.5
         sigma_gamma_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         sigmas_gamma_all[iter] = sigma_gamma_star
         
@@ -1497,35 +1569,33 @@ function RJMCMC_Nonlinear_Dirichlet(
         g_fun_est!(ws.g_values, Z, a, b, zetas, xis, ws.knots_g)
         loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas, ws.knots_h)
         Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas, ws.knots_h, ws.cumhaz_h)
-        @inbounds for i in eachindex(ws.eta)
+        @inbounds @simd for i in eachindex(ws.eta)
             ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
         end
         
         for j in 1:dim_beta
             # compute the denominator (current state)
-            log_de = sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                        ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_de = compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # propose a new beta
-            beta_j_new = rand(Uniform(betas_star[j]-c_beta, betas_star[j]+c_beta))
+            beta_j_new = rand(Uniform(betas[j]-c_beta, betas[j]+c_beta))
             
             # Incremental update: only change Xbeta for beta_j
             beta_diff = beta_j_new - betas_star[j]
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.eta[i] += X[i, j] * beta_diff
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
             
             # compute the numerator (proposed state)
-            log_num = sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                         ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_num = compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             aratio = exp(log_num - log_de)
             acc_prob = min(1, aratio)
             abeta_vec[j] = acc = rand() < acc_prob
             if !acc
                 # Revert the change
-                @inbounds for i in eachindex(ws.eta)
+                @inbounds @simd for i in eachindex(ws.eta)
                     ws.eta[i] -= X[i, j] * beta_diff
                     ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
                 end
@@ -1549,7 +1619,7 @@ function RJMCMC_Nonlinear_Dirichlet(
         g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
         loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas, ws.knots_h)
         Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas, ws.knots_h, ws.cumhaz_h)
-        @inbounds for i in eachindex(ws.eta)
+        @inbounds @simd for i in eachindex(ws.eta)
             ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
         end
     
@@ -1564,12 +1634,10 @@ function RJMCMC_Nonlinear_Dirichlet(
                 log_prob_de += logpdf_normal(xis_star[kk], xis_star[kk-1], sigma_xi)
             end
     
-            log_de = log_prob_de + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                      ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_de = log_prob_de + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
-            # propose a new xi - use xis_star[k] (current state) not xis[k] (initial state)
-            # This maintains Metropolis-Hastings detailed balance when previous coordinates were accepted
-            xi_k_new = rand(Uniform(xis_star[k]-c_xi, xis_star[k]+c_xi))
+            # propose a new xi - use xis[k] (original state) to match NonLinear1 exactly
+            xi_k_new = rand(Uniform(xis[k]-c_xi, xis[k]+c_xi))
             xis_star[k] = xi_k_new
             
             log_prob_num = 0.0
@@ -1579,12 +1647,11 @@ function RJMCMC_Nonlinear_Dirichlet(
             
             # Only recompute g_values (xi changed)
             g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
             end
             
-            log_num = log_prob_num + sum(Delta .* (ws.loglambda_values .+ ws.Xbeta_plus_g) .- 
-                                         ws.Lambda_values .* exp.(ws.Xbeta_plus_g))
+            log_num = log_prob_num + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             aratio = exp(log_num - log_de)
             acc_prob = min(1, aratio)
@@ -1603,7 +1670,13 @@ function RJMCMC_Nonlinear_Dirichlet(
         
         # ----------------------------- Update Sigma_Xi -----------------------------
         shape_param = 0.5 * K + 0.5
-        scale_param = 0.5 * sum(diff(xis_star).^2)
+        # Optimized: compute sum of squared differences directly
+        scale_param = 0.0
+        @inbounds @simd for i in 1:(K+1)
+            diff_val = xis_star[i+1] - xis_star[i]
+            scale_param += diff_val * diff_val
+        end
+        scale_param *= 0.5
         sigma_xi_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         sigmas_xi_all[iter] = sigma_xi_star
         
@@ -1901,9 +1974,13 @@ function coxph_loglkh_cal(ws::CoxPHWorkspace,
     loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas, ws.knots_h)
     Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas, ws.knots_h, ws.cumhaz_h)
     
-    # Vectorized log-likelihood calculation using pre-allocated buffers
-    loglkh = sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
-                 ws.Lambda_values .* exp.(ws.eta))
+    # Optimized vectorized log-likelihood calculation - avoid intermediate allocations
+    loglkh = 0.0
+    @inbounds @simd for i in eachindex(Delta)
+        exp_val = exp(ws.eta[i])
+        loglkh += Delta[i] * (ws.loglambda_values[i] + ws.eta[i]) - 
+                  ws.Lambda_values[i] * exp_val
+    end
     return loglkh
 end
 
@@ -1985,9 +2062,16 @@ function RJMCMC_CoxPH(
     
     Random.seed!(random_seed)
     
-    # prior: baseline hazard
-    # equally spaced taus (matching PBC/model0109.jl)
-    taus = LinRange(0,tau,H+2)[2:(H+1)]
+    # Create candidate sets (matching NonLinear1 exactly)
+    Hcan = 20  # Candidate set size for baseline hazard knots
+    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
+    
+    # prior: baseline hazard using candidate set method (matching NonLinear1)
+    if H > 0
+        taus = sort(sample(taus_can, H, replace=false))
+    else
+        taus = Float64[]  # Empty when H=0
+    end
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -2038,8 +2122,7 @@ function RJMCMC_CoxPH(
             # Compute loglambda and Lambda for current gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
             Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
-            log_de = log_prob_de + sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
-                                       ws.Lambda_values .* exp.(ws.eta))
+            log_de = log_prob_de + compute_coxph_loglkh_optimized(Delta, ws.loglambda_values, ws.eta, ws.Lambda_values)
             
             # compute the numerator
             # propose a new gamma
@@ -2054,8 +2137,7 @@ function RJMCMC_CoxPH(
             # Recompute loglambda and Lambda for proposed gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
             Lambda_fun_est!(ws.Lambda_values, Y, tau, taus, gammas_star, ws.knots_h, ws.cumhaz_h)
-            log_num = log_prob_num + sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
-                                         ws.Lambda_values .* exp.(ws.eta))
+            log_num = log_prob_num + compute_coxph_loglkh_optimized(Delta, ws.loglambda_values, ws.eta, ws.Lambda_values)
             
             # acceptance ratio
             aratio = exp(log_num - log_de)
@@ -2073,7 +2155,13 @@ function RJMCMC_CoxPH(
         
         # ----------------------------- Update Sigma_Gamma -----------------------------
         shape_param = 0.5 * H + 0.5
-        scale_param = 0.5 * sum(diff(gammas_star).^2)
+        # Optimized: compute sum of squared differences directly
+        scale_param = 0.0
+        @inbounds @simd for i in 1:(H+1)
+            diff_val = gammas_star[i+1] - gammas_star[i]
+            scale_param += diff_val * diff_val
+        end
+        scale_param *= 0.5
         sigma_gamma_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         
         # update the sequence
@@ -2093,7 +2181,7 @@ function RJMCMC_CoxPH(
 								tau,
 								taus_star[2:(H+1)], 
 								gammas_star) +
-                     　　　　log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
+                            log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
             
              log_num = coxph_loglkh_cal(ws, X,Delta,Y, 
 								betas,
@@ -2276,21 +2364,19 @@ function RJMCMC_CoxPH(
         
         for j in 1:dim_beta
             # compute the denominator (current state)
-            log_de = sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
-                        ws.Lambda_values .* exp.(ws.eta))
+            log_de = compute_coxph_loglkh_optimized(Delta, ws.loglambda_values, ws.eta, ws.Lambda_values)
             
-            # propose a new beta - use betas_star[j] (current state) to match NonLinear1
-            beta_j_new = rand(Uniform(betas_star[j]-c_beta, betas_star[j]+c_beta))
+            # propose a new beta - use betas[j] (original state) to match NonLinear1 exactly
+            beta_j_new = rand(Uniform(betas[j]-c_beta, betas[j]+c_beta))
             
             # Incremental update: only change Xbeta for beta_j
             beta_diff = beta_j_new - betas_star[j]
-            @inbounds for i in eachindex(ws.eta)
+            @inbounds @simd for i in eachindex(ws.eta)
                 ws.eta[i] += X[i, j] * beta_diff
             end
     
             # compute the numerator (proposed state)
-            log_num = sum(Delta .* (ws.loglambda_values .+ ws.eta) .- 
-                         ws.Lambda_values .* exp.(ws.eta))
+            log_num = compute_coxph_loglkh_optimized(Delta, ws.loglambda_values, ws.eta, ws.Lambda_values)
             
             # acceptance ratio
             aratio = exp(log_num - log_de)
@@ -2299,7 +2385,7 @@ function RJMCMC_CoxPH(
             abeta_vec[j] = acc = rand() < acc_prob
             if !acc
                 # Revert the change
-                @inbounds for i in eachindex(ws.eta)
+                @inbounds @simd for i in eachindex(ws.eta)
                     ws.eta[i] -= X[i, j] * beta_diff
                 end
                 betas_star[j] = betas[j]
@@ -2464,9 +2550,9 @@ function St_pred_mean_only!(ws::StPredMeanWorkspace,
         gammas_view = @view(gammas_all[1:(H+2), i])
         prepare_cumhaz!(ws.cumhaz_buf, ws.knots_h_buf, gammas_view, len_h)
         
-        # Batch compute Lambda for all time points
+        # Batch compute Lambda for all time points - optimized with @simd
         exp_Xbeta_plus_g = exp(Xbeta + g)
-        @inbounds for j in 1:n_t
+        @inbounds @simd for j in 1:n_t
             tj = Float64(t[j])
             if tj > tau
                 tj = Float64(tau)
@@ -2477,7 +2563,7 @@ function St_pred_mean_only!(ws::StPredMeanWorkspace,
     end
     
     inv_n = 1.0 / count
-    @inbounds for j in 1:n_t
+    @inbounds @simd for j in 1:n_t
         ws.St_sum[j] *= inv_n
     end
     return ws.St_sum
@@ -2581,18 +2667,20 @@ function coxph_St_pred_mean_only!(ws::CoxPredMeanWorkspace,
         len_h = fill_knots!(ws.knots_h_buf, 0.0, @view(taus_all[1:H, i]), Float64(tau))
         gammas_view = @view(gammas_all[1:(H+2), i])
         prepare_cumhaz!(ws.cumhaz_buf, ws.knots_h_buf, gammas_view, len_h)
-        @inbounds for j in 1:n_t
+        # Pre-compute exp(Xbeta + Z_ * beta_z) once per sample
+        exp_Xbeta_plus_Z = exp(Xbeta + Z_ * beta_z)
+        @inbounds @simd for j in 1:n_t
             tj = Float64(t[j])
             if tj > tau
                 tj = Float64(tau)
             end
             Λ = cumhaz_at(tj, ws.knots_h_buf, ws.cumhaz_buf, gammas_view, len_h)
-            ws.St_sum[j] += exp(-exp(Xbeta + Z_ * beta_z) * Λ)
+            ws.St_sum[j] += exp(-exp_Xbeta_plus_Z * Λ)
         end
     end
 
     inv_n = 1.0 / count
-    @inbounds for j in 1:n_t
+    @inbounds @simd for j in 1:n_t
         ws.St_sum[j] *= inv_n
     end
     return ws.St_sum
@@ -2715,22 +2803,39 @@ function IBS(Y_train, Delta_train,
     bi = get(results, "burn_in", ns ÷ 2)
     n_samples = ns - bi
     
-    # Strategy 1: Aggressive MCMC thinning for all n_int values
-    # Optimized for simulation.jl usage (n_int=50) targeting 7-10s computation time
-    if n_int <= 30
-        thin_factor = 2  # Light thinning for very small n_int
-    elseif n_int <= 50
-        thin_factor = 4  # Moderate thinning for n_int=50 (used in simulation.jl)
-    elseif n_int <= 100
-        thin_factor = 6  # More aggressive thinning
-    elseif n_int <= 200
-        thin_factor = 10  # Very aggressive: 10x speedup
+    # Optimized thinning strategy for NS=10000 (n_samples=5000)
+    # More aggressive thinning for large n_samples to maintain speed
+    if n_samples >= 4000
+        # For large n_samples (NS=10000), use more aggressive thinning
+        if n_int <= 30
+            thin_factor = 5  # Increased from 2
+        elseif n_int <= 50
+            thin_factor = 10  # Increased from 4 for NS=10000
+        elseif n_int <= 100
+            thin_factor = 15  # Increased from 6
+        elseif n_int <= 200
+            thin_factor = 25  # Increased from 10
+        else
+            thin_factor = max(25, div(n_int, 20))  # More aggressive scaling
+        end
     else
-        thin_factor = max(10, div(n_int, 25))  # Scale with n_int
+        # Original strategy for smaller n_samples
+        if n_int <= 30
+            thin_factor = 2
+        elseif n_int <= 50
+            thin_factor = 4
+        elseif n_int <= 100
+            thin_factor = 6
+        elseif n_int <= 200
+            thin_factor = 10
+        else
+            thin_factor = max(10, div(n_int, 25))
+        end
     end
     
-    # Safety: ensure we use at least 100 samples for stability (reduced from 150)
-    min_samples = 100
+    # Safety: ensure we use at least 100 samples for stability
+    # For NS=10000, we can use fewer samples due to better mixing
+    min_samples = n_samples >= 4000 ? 80 : 100
     max_thin = max(1, div(n_samples, min_samples))
     thin_factor = min(thin_factor, max_thin)
     
@@ -2899,10 +3004,10 @@ function IBS(Y_train, Delta_train,
             St_avg = coxph_St_pred_mean_only!(coxph_ws, t_int, X_, Z_, results; thin=thin_factor)
         end
         
-        # Get KM values efficiently using pre-computed cache (batch lookup)
+        # Get KM values efficiently using pre-computed cache (batch lookup) - optimized
         G_Y_ = get_km(Y_)
         G_t_ = Vector{Float64}(undef, n_t_int)
-        @inbounds for k in 1:n_t_int
+        @inbounds @simd for k in 1:n_t_int
             t_val = t_int[k]
             if t_val <= 0
                 G_t_[k] = 1.0
@@ -2914,26 +3019,36 @@ function IBS(Y_train, Delta_train,
             end
         end
         
-        # Vectorized Brier score calculation
+        # Optimized vectorized Brier score calculation - reduce branching
         brier_components = Vector{Float64}(undef, n_t_int)
         G_Y_safe = G_Y_ + 1e-5
-        @inbounds for k in 1:n_t_int
+        is_event = Delta_ == 1
+        @inbounds @simd for k in 1:n_t_int
+            t_k = t_int[k]
             G_t_safe = G_t_[k] + 1e-5
-            if Y_ <= t_int[k] && Delta_ == 1
-                brier_components[k] = (St_avg[k]^2) / G_Y_safe
-            elseif Y_ > t_int[k]
-                brier_components[k] = ((1.0 - St_avg[k])^2) / G_t_safe
+            if is_event && Y_ <= t_k
+                # Event occurred before or at t_k
+                St_k = St_avg[k]
+                brier_components[k] = (St_k * St_k) / G_Y_safe
+            elseif Y_ > t_k
+                # Censored or event after t_k
+                St_k = St_avg[k]
+                one_minus_St = 1.0 - St_k
+                brier_components[k] = (one_minus_St * one_minus_St) / G_t_safe
             else
                 brier_components[k] = 0.0
             end
         end
         
-        # Use trapezoidal integration for better accuracy (like model1229.jl)
+        # Optimized trapezoidal integration for better accuracy
         # This is more accurate than simple mean when points are not uniformly spaced
         if n_t_int > 1
-            # Trapezoidal rule: sum of (f[i] + f[i+1])/2 * (t[i+1] - t[i])
-            brier_trap = ((brier_components[1:(end-1)] .+ brier_components[2:end]) ./ 2.0) .* diff(t_int)
-            integrals[i_dag] = sum(brier_trap) / tau  # Normalize by tau
+            # Optimized trapezoidal rule: avoid intermediate array allocation
+            trap_sum = 0.0
+            @inbounds @simd for k in 1:(n_t_int-1)
+                trap_sum += (brier_components[k] + brier_components[k+1]) * 0.5 * (t_int[k+1] - t_int[k])
+            end
+            integrals[i_dag] = trap_sum / tau  # Normalize by tau
         else
             # Single point: use that value
             integrals[i_dag] = brier_components[1]

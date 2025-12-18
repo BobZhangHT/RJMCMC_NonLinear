@@ -4,6 +4,7 @@ Manifest.toml
 *.jl.*.cov
 *.ji
 *.ipynb
+*.md
 
 # Editor and OS cruft
 .vscode/

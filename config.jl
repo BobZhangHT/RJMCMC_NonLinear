@@ -48,7 +48,7 @@ Return a ready-to-use simulation configuration. `demo` keeps the same sampler se
 as the notebooks but uses fewer replications; `full` mirrors the original defaults.
 """
 function default_simulation_config(mode::SimulationMode=full; n_workers::Int=max(1, Threads.nthreads()))
-    ns = 5000
+    ns = 10000
     n_test = 500
     g_types = ["linear", "quad", "sin"]
     # Demo: all manuscript sizes but with fewer replications; Full: all manuscript sizes.

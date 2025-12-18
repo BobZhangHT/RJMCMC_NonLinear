@@ -203,6 +203,8 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     dir = task_dir(base_dir, task)
     results_path = joinpath(dir, "results_dict.jls")
     existing = Dict{Any, Any}()
+    
+    # Auto-resume: Load existing results if available (when not using --reset)
     if isfile(results_path)
         try
             t1 = time()
@@ -210,10 +212,13 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
                 existing = deserialize(io)
             end
             timings["read_existing"] = time() - t1
+            println("[Task rep=$(task.idx)] Loaded existing results from $(results_path)")
         catch err
             @warn "Failed to read existing results file $(results_path); will recompute selected methods." exception=(err, catch_backtrace())
             existing = Dict{Any, Any}()
         end
+    else
+        println("[Task rep=$(task.idx)] No existing results found. Starting fresh computation.")
     end
     
     t_last = time()
@@ -267,13 +272,42 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     # Always disable MCMC progress bar, only show task-level progress
     show_mcmc_progress = false
 
+    # Auto-resume logic: Check which methods need to be run
+    # If method is in rerun_methods, force recomputation
+    # Otherwise, check if method is already done in existing results
     need_nl1 = (:nonlinear1 in methods_to_run) && (:nonlinear1 in rerun_methods || !method_done(existing, :nonlinear1))
     need_nl2 = (:nonlinear2 in methods_to_run) && (:nonlinear2 in rerun_methods || !method_done(existing, :nonlinear2))
     need_cox = (:coxph in methods_to_run) && (:coxph in rerun_methods || !method_done(existing, :coxph))
 
     if !(need_nl1 || need_nl2 || need_cox)
+        println("[Task rep=$(task.idx)] All requested methods already completed. Skipping task.")
         return :skipped
     end
+    
+    # Print which methods will be run/skipped for better visibility
+    methods_status = String[]
+    if :nonlinear1 in methods_to_run
+        if need_nl1
+            push!(methods_status, "NonLinear1: will run")
+        else
+            push!(methods_status, "NonLinear1: already done, skipping")
+        end
+    end
+    if :nonlinear2 in methods_to_run
+        if need_nl2
+            push!(methods_status, "NonLinear2: will run")
+        else
+            push!(methods_status, "NonLinear2: already done, skipping")
+        end
+    end
+    if :coxph in methods_to_run
+        if need_cox
+            push!(methods_status, "CoxPH: will run")
+        else
+            push!(methods_status, "CoxPH: already done, skipping")
+        end
+    end
+    println("[Task rep=$(task.idx)] Methods status: $(join(methods_status, ", "))")
 
     ns = cfg.ns
     bi = cfg.burn_in
@@ -1096,10 +1130,26 @@ function main()
     
     cfg = default_simulation_config(mode; n_workers=workers)
     base_dir = joinpath(RESULTS_DIR, "simulation", string(cfg.mode))
-
-    if reset && isdir(base_dir)
-        rm(base_dir; recursive=true, force=true)
+    
+    # If --reset is set, delete all demo and full directories before running
+    if reset
+        simulation_base = joinpath(RESULTS_DIR, "simulation")
+        if isdir(simulation_base)
+            demo_dir = joinpath(simulation_base, "demo")
+            full_dir = joinpath(simulation_base, "full")
+            
+            if isdir(demo_dir)
+                println("Deleting existing demo directory: $(demo_dir)")
+                rm(demo_dir; recursive=true, force=true)
+            end
+            if isdir(full_dir)
+                println("Deleting existing full directory: $(full_dir)")
+                rm(full_dir; recursive=true, force=true)
+            end
+            println("Reset complete. All previous simulation results have been deleted.")
+        end
     end
+    
     ensure_results_dir(base_dir)
     
     # If --replot is set, delete existing plot directories to force regeneration
