@@ -13,8 +13,6 @@ using StatsBase
 using Statistics
 using Base.Threads
 using Plots
-using StatsPlots
-using CategoricalArrays
 using LaTeXStrings
 using SpecialFunctions  # Required by model.jl for Dirichlet prior
 
@@ -264,6 +262,19 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     end
     timings["data_io"] = time() - t1
 
+    # Data-driven knot bounds used by the updated model (for reporting/traceability)
+    obs_time = (Y_train .* Delta_train)
+    obs_time = obs_time[obs_time .> 0]
+    if !isempty(obs_time)
+        tau_min = quantile(obs_time, 0.05)
+        tau_max = quantile(obs_time, 0.95)
+    else
+        tau_min = 0.0
+        tau_max = maximum(Y_train)
+    end
+    zeta_min = quantile(Z_train, 0.05)
+    zeta_max = quantile(Z_train, 0.95)
+
 
     # Use known support for Z to avoid boundary bias/kinks when plotting on full grid.
     a, b = cfg.z_min, cfg.z_max
@@ -492,6 +503,10 @@ function run_single_task(task::SimulationTask, cfg::SimulationConfig, base_dir::
     results_dict["ns"] = ns
     results_dict["burn_in"] = bi
     results_dict["mode"] = string(cfg.mode)
+    results_dict["tau_min"] = tau_min
+    results_dict["tau_max"] = tau_max
+    results_dict["zeta_min"] = zeta_min
+    results_dict["zeta_max"] = zeta_max
 
     # Optimized file writing: use atomic write with retry for Windows compatibility
     # Use unique temp filename per task to avoid conflicts when tasks run in parallel
@@ -813,7 +828,7 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                     savefig(plt_g, joinpath(plots_dir, "g_$(g_type)_n$(n).pdf"))
                 end
 
-                # Λ(t) plot with both NonLinear methods
+                # Lambda(t) plot with both NonLinear methods
                 if !isempty(lambda_non_samples)
                     lam_non_mat = hcat(lambda_non_samples...)
                     lam_non_mean = vec(mean(lam_non_mat, dims=2))
@@ -828,7 +843,7 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                     end
                     
                     xlabel!(plt_lam, "t")
-                    ylabel!(plt_lam, "Λ(t)")
+                    ylabel!(plt_lam, "Lambda(t)")
                     title!(plt_lam, "n = $(n)")
                     savefig(plt_lam, joinpath(plots_dir, "lambda_$(g_type)_n$(n).pdf"))
                 end
@@ -947,7 +962,7 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
         available_n_lam = [n for n in cfg.n_values if haskey(lam_non1_means, (g_type, n)) || haskey(lam_non2_means, (g_type, n))]
         available_n_g = [n for n in cfg.n_values if haskey(g_non1_means, (g_type, n)) || haskey(g_non2_means, (g_type, n))]
         
-        # Λ panels - compare NonLinear1 and NonLinear2
+        # Lambda panels - compare NonLinear1 and NonLinear2
         if !isempty(available_n_lam)
             n_lam_count = length(available_n_lam)
             lam_layout = (1, n_lam_count)

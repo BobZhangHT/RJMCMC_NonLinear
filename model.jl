@@ -27,27 +27,46 @@ export RJMCMC_Nonlinear,
        DEFAULT_KMAX
 
 const DEFAULT_NS = 5000
-const DEFAULT_BURN_IN = DEFAULT_NS ÷ 2
+const DEFAULT_BURN_IN = div(DEFAULT_NS, 2)
 const DEFAULT_HMAX = 10
 const DEFAULT_KMAX = 10
 
-@inline log2π() = 1.8378770664093453 # log(2π)
+@inline log2pi() = 1.8378770664093453 # log(2*pi)
 
-@inline function logpdf_normal(x::Float64, μ::Float64, σ::Float64)
-    invσ = 1.0 / σ
-    z = (x - μ) * invσ
-    return -0.5 * (z * z + log2π()) - log(σ)
+@inline function logpdf_normal(x::Float64, mu::Float64, sigma::Float64)
+    inv_sigma = 1.0 / sigma
+    z = (x - mu) * inv_sigma
+    return -0.5 * (z * z + log2pi()) - log(sigma)
+end
+
+
+function log_rw1_prior(values::Vector{Float64}, sigma::Float64; anchor_first::Bool=false, anchor_std::Float64=5.0)
+    logp = 0.0
+    if anchor_first && !isempty(values)
+        logp += logpdf_normal(values[1], 0.0, anchor_std)
+    end
+    n = length(values)
+    if n >= 2
+        @inbounds for i in 2:n
+            logp += logpdf_normal(values[i] - values[i - 1], 0.0, sigma)
+        end
+    end
+    return logp
+end
+
+function log_rw1_xi_prior(values::Vector{Float64}, sigma::Float64)
+    return log_rw1_prior(values, sigma; anchor_first=false, anchor_std=1e-8)
 end
 
 mutable struct LikelihoodWorkspace{T<:Float64}
-    eta::Vector{T}          # X * betas (then reused as η = Xβ + g)
+    eta::Vector{T}          # X * betas (then reused as eta = Xbeta + g)
     knots_h::Vector{T}      # baseline knots (0, taus..., tau)
-    cumhaz_h::Vector{T}     # cumulative ∫ exp(logλ) up to each knot
+    cumhaz_h::Vector{T}     # cumulative integral of exp(loglambda) up to each knot
     knots_g::Vector{T}      # g(z) knots (a, zetas..., b)
     g_values::Vector{T}     # g(z) values (pre-allocated)
-    loglambda_values::Vector{T}  # logλ(Y) values (pre-allocated)
-    Lambda_values::Vector{T}     # Λ(Y) values (pre-allocated)
-    Xbeta_plus_g::Vector{T}      # Xβ + g (pre-allocated)
+    loglambda_values::Vector{T}  # loglambda(Y) values (pre-allocated)
+    Lambda_values::Vector{T}     # Lambda(Y) values (pre-allocated)
+    Xbeta_plus_g::Vector{T}      # Xbeta + g (pre-allocated)
 end
 
 function LikelihoodWorkspace(n::Integer, Hmax::Integer, Kmax::Integer)
@@ -185,7 +204,6 @@ function loglambda_fun_est!(out::Vector{Float64}, t, tau, taus, gammas, knots_bu
     return out
 end
 
-# Piecewise-linear nonlinear covariate effect g(z) over [a, b].
 function g_fun_est(z, a, b, zetas, xis)
     out = Vector{Float64}(undef, length(z))
     K = length(zetas)
@@ -224,9 +242,9 @@ function g_fun_est!(out::Vector{Float64}, z, a, b, zetas, xis, knots_buf::Vector
     return out
 end
 
-# Integrated hazard Λ(t) corresponding to the piecewise log-λ definition.
+# Integrated hazard Lambda(t) corresponding to the piecewise loglambda definition.
 function Lambda_fun_est(t, tau, taus, gammas)
-    # Match historical formulation (model1229): clamp t to [0, tau] to avoid extrapolation.
+    # Clamp t to [0, tau] to avoid extrapolation beyond the last observed event.
     out = Vector{Float64}(undef, length(t))
     H = length(taus)
     knots = Vector{Float64}(undef, H + 2)
@@ -385,6 +403,25 @@ function RJMCMC_Nonlinear(
     obs_time = (Y .* Delta) 
     obs_time = obs_time[obs_time .> 0]
     tau  = maximum(obs_time)
+
+    # Knot bounds: use 5%-95% quantiles from observed Y (events) and Z.
+    tau_min = quantile(obs_time, 0.05)
+    tau_max = quantile(obs_time, 0.95)
+    tau_range = tau_max - tau_min
+    if tau_range <= 0.0
+        tau_min = 0.0
+        tau_max = tau
+        tau_range = tau_max - tau_min
+    end
+    # Fallback to full domain if quantiles collapse.
+    zeta_min = quantile(Z, 0.05)
+    zeta_max = quantile(Z, 0.95)
+    zeta_range = zeta_max - zeta_min
+    if zeta_range <= 0.0
+        zeta_min = a
+        zeta_max = b
+        zeta_range = zeta_max - zeta_min
+    end
     
     # prior parameter for number of probability
     mu_H = mu_K = 1
@@ -445,19 +482,9 @@ function RJMCMC_Nonlinear(
     
     Random.seed!(random_seed)
     
-    # Create candidate sets (matching model1229.jl exactly)
-    Hcan = 20  # Candidate set size for baseline hazard knots
-    Kcan = 20  # Candidate set size for g(z) knots
-    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
-    zetas_can = LinRange(a, b, Kcan+2)[2:(Kcan+1)]
-	
     # prior: baseline hazard
-    # Use candidate set method (matching model1229.jl exactly)
-    if H > 0
-        taus = sort(sample(taus_can, H, replace=false))
-    else
-        taus = Float64[]  # Empty when H=0
-    end
+    # equally spaced taus
+    taus = LinRange(tau_min, tau_max, H + 2)[2:(H + 1)]
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -467,19 +494,16 @@ function RJMCMC_Nonlinear(
     end  
     
     # prior: smooth function
-    # Use candidate set method (matching model1229.jl exactly)
-    if K > 0
-        zetas = sort(sample(zetas_can, K, replace=false))
-    else
-        zetas = Float64[]  # Empty when K=0
-    end
+    # equally spaced zetas
+    zetas = LinRange(zeta_min, zeta_max, K + 2)[2:(K + 1)]
     zetas_ = [a zetas' b][1,:]
     
     xis = zeros(K+2)
-    xis[1] = 0
+    xis[1] = 0.0
     for i in 2:(K+2)
-        xis[i] = rand(Normal(xis[i-1],1))
+        xis[i] = rand(Normal(xis[i-1], 1))
     end
+    xis[1] = 0.0
     
     # beta: coefficients
     betas = zeros(dim_beta)
@@ -525,13 +549,11 @@ function RJMCMC_Nonlinear(
         # Pre-compute components that don't change during gamma updates
         mul!(ws.eta, X, betas)
         g_fun_est!(ws.g_values, Z, a, b, zetas, xis, ws.knots_g)
+        fill_knots!(ws.knots_h, 0.0, taus, Float64(tau))
         
         for h in 1:(H+2)        
             # compute the denominator - use optimized logpdf_normal instead of log(pdf(...))
-            log_prob_de = logpdf_normal(gammas_star[1], 0.0, 5.0)
-            @inbounds for hh in 2:(H+2)
-                log_prob_de += logpdf_normal(gammas_star[hh], gammas_star[hh-1], sigma_gamma)
-            end
+            log_prob_de = log_rw1_prior(gammas_star, sigma_gamma; anchor_first=true, anchor_std=5.0)
             
             # Compute loglambda and Lambda for current gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
@@ -546,10 +568,7 @@ function RJMCMC_Nonlinear(
             gamma_h_new = rand(Uniform(gammas[h]-c_gamma, gammas[h]+c_gamma))
             gammas_star[h] = gamma_h_new
             
-            log_prob_num = logpdf_normal(gammas_star[1], 0.0, 5.0)
-            @inbounds for hh in 2:(H+2)
-                log_prob_num += logpdf_normal(gammas_star[hh], gammas_star[hh-1], sigma_gamma)
-            end
+            log_prob_num = log_rw1_prior(gammas_star, sigma_gamma; anchor_first=true, anchor_std=5.0)
             
             # Recompute loglambda and Lambda for proposed gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
@@ -575,13 +594,14 @@ function RJMCMC_Nonlinear(
         
         # ----------------------------- Update Sigma_Gamma -----------------------------
         shape_param = 0.5 * H + 0.5
-        # Optimized: compute sum of squared differences directly
+        # Optimized: compute sum of squared first differences directly (RW1)
         scale_param = 0.0
         @inbounds @simd for i in 1:(H+1)
             diff_val = gammas_star[i+1] - gammas_star[i]
             scale_param += diff_val * diff_val
         end
         scale_param *= 0.5
+        scale_param = max(scale_param, eps(Float64))
         sigma_gamma_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         
         # update the sequence
@@ -594,30 +614,34 @@ function RJMCMC_Nonlinear(
                 
         if H > 0
              hc = rand(1:H)
-             tau_hc_star = rand(Uniform(taus_star[hc],taus_star[hc+2]))
-             taus_star_replace[hc+1] = tau_hc_star
-             log_de = loglkh_cal(ws, X,Z,Delta,Y, 
-                                        betas,
-                                        tau,
-                                        taus_star[2:(H+1)], 
-                                        gammas_star,
-                                        a,b,zetas,xis) +
-                            log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
-            
-             log_num = loglkh_cal(ws, X,Z,Delta,Y, 
-                                        betas,
-                                        tau,
-                                        taus_star_replace[2:(H+1)], 
-                                        gammas_star,
-                                        a,b,zetas,xis) + 
-                            log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc])
-                    
-             aratio = exp(log_num - log_de)
-             acc_prob = min(1, aratio)
-             # accept or not
-             acc = rand() < acc_prob
-             # update the taus
-             taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1] 
+             lower = max(taus_star[hc], tau_min)
+             upper = min(taus_star[hc+2], tau_max)
+             if lower < upper
+                 tau_hc_star = rand(Uniform(lower, upper))
+                 taus_star_replace[hc+1] = tau_hc_star
+                 log_de = loglkh_cal(ws, X,Z,Delta,Y, 
+                                            betas,
+                                            tau,
+                                            taus_star[2:(H+1)], 
+                                            gammas_star,
+                                            a,b,zetas,xis) +
+                                log(upper - taus_star[hc+1]) + log(taus_star[hc+1] - lower)
+
+                 log_num = loglkh_cal(ws, X,Z,Delta,Y, 
+                                            betas,
+                                            tau,
+                                            taus_star_replace[2:(H+1)], 
+                                            gammas_star,
+                                            a,b,zetas,xis) + 
+                                log(upper - tau_hc_star) + log(tau_hc_star - lower)
+                        
+                 aratio = exp(log_num - log_de)
+                 acc_prob = min(1, aratio)
+                 # accept or not
+                 acc = rand() < acc_prob
+                 # update the taus
+                 taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1]
+             end
         end
         
         # # ------------ RJMCMC: Perform RJ-Update for (H, taus, gammas)------------
@@ -639,7 +663,7 @@ function RJMCMC_Nonlinear(
                 # ------------ codes for H_star > H (generate a new knot) ------------
             
                 # sample tau from the unselected observed time
-                tau_star = rand(Uniform(0,tau))
+                tau_star = rand(Uniform(tau_min, tau_max))
                 
                 # merge new tau into a new list 
                 taus_star_add = sort([taus_star; tau_star])
@@ -668,10 +692,10 @@ function RJMCMC_Nonlinear(
                                         a,b,zetas,xis) + 
                        log(2*H+3) + log(2*H+2) + log(tau_star-taus_star[h]) + log(taus_star[h+1]-tau_star) + 
                        logpdf_normal(gamma_star, gammas_star[h], sigma_gamma_star) +
-                       logpdf_normal(gammas_star[h+1], gamma_star, sigma_gamma_star) -
-                       2*log(tau) - log(taus_star[h+1] - taus_star[h]) - 
-                       logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
-                       log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
+                       logpdf_normal(gammas_star[h+1], gamma_star, sigma_gamma_star) - 
+                       2*log(tau_range) - log(taus_star[h+1] - taus_star[h]) +
+                       - logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
+                       log((1-r_HB)/(H+1)) - log(r_HB_star/tau_range) - log(U*(1-U)) + log(mu_H) - log(H+1)
                 
                 acc_BM_prob = min(1, exp(log_a_BM))
                 
@@ -716,9 +740,9 @@ function RJMCMC_Nonlinear(
 
 				# update the calculation of U 1206
 				A_hp1 = (gammas_star[h+2]-gammas_star[h+1])/(taus_star[h+2]-taus_star[h+1])
-				A_h = (gammas_star[h+1]-gammas_star[h])/(taus_star[h+1]-taus_star[h])
-				U = exp(A_h)/(exp(A_h)+exp(A_hp1))
-                
+                A_h = (gammas_star[h+1]-gammas_star[h])/(taus_star[h+1]-taus_star[h])
+                U = exp(A_h)/(exp(A_h)+exp(A_hp1))
+
                 # logarithmic 
                 log_a_DM = loglkh_cal(ws, X,Z,Delta,Y, 
                                     betas,
@@ -732,13 +756,13 @@ function RJMCMC_Nonlinear(
                                     taus_star[2:(H+1)], 
                                     gammas_star,
                                     a,b,zetas,xis) + 
-                       2*log(tau) + log(taus_star_rm[h+1]-taus_star_rm[h]) + 
-                       logpdf_normal(gammas_star_rm[h+1], gammas_star_rm[h], sigma_gamma_star) - 
+                       2*log(tau_range) + log(taus_star_rm[h+1]-taus_star_rm[h]) + 
+                       logpdf_normal(gammas_star_rm[h+1], gammas_star_rm[h], sigma_gamma_star) -
                        log(2*H+1) - log(2*H) - 
-                       log(taus_star[h+2]-taus_star[h+1]) - log(taus_star[h+1]-taus_star[h]) - 
-                       logpdf_normal(gammas_star[h+2], gammas_star[h+1], sigma_gamma_star) -
-                       logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
-                       log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
+                       log(taus_star[h+2]-taus_star[h+1]) - log(taus_star[h+1]-taus_star[h]) +
+                       - logpdf_normal(gammas_star[h+2], gammas_star[h+1], sigma_gamma_star) +
+                       - logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
+                       log(r_HB/tau_range) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
         
                 acc_DM_prob = min(1, exp(log_a_DM))
                 
@@ -843,6 +867,7 @@ function RJMCMC_Nonlinear(
         @inbounds @simd for i in eachindex(ws.eta)
             ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
         end
+        fill_knots!(ws.knots_g, Float64(a), zetas, Float64(b))
     
         for k in 2:(K+2)        
             # Save current state before proposing (needed for rejection case)
@@ -850,23 +875,17 @@ function RJMCMC_Nonlinear(
             # updated by previous accepted proposals in this loop
             xi_k_current = xis_star[k]
             
-            # compute the denominator - use optimized logpdf_normal
-            log_prob_de = 0.0
-            @inbounds for kk in 2:(K+2)
-                log_prob_de += logpdf_normal(xis_star[kk], xis_star[kk-1], sigma_xi)
-            end
+            # compute the denominator - RW2 prior
+            log_prob_de = log_rw1_xi_prior(xis_star, sigma_xi)
     
             log_de = log_prob_de + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
             # compute the numerator
-            # propose a new xi - use xis[k] (original state) to match model1229.jl exactly
+            # propose a new xi - use original state for symmetric proposals
             xi_k_new = rand(Uniform(xis[k]-c_xi, xis[k]+c_xi))
             xis_star[k] = xi_k_new
             
-            log_prob_num = 0.0
-            @inbounds for kk in 2:(K+2)
-                log_prob_num += logpdf_normal(xis_star[kk], xis_star[kk-1], sigma_xi)
-            end
+            log_prob_num = log_rw1_xi_prior(xis_star, sigma_xi)
             
             # Only recompute g_values (xi changed)
             g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
@@ -896,13 +915,14 @@ function RJMCMC_Nonlinear(
         
         # ----------------------------- Update Sigma_Xi -----------------------------
         shape_param = 0.5 * K + 0.5
-        # Optimized: compute sum of squared differences directly
+        # Optimized: compute sum of squared first differences directly (RW1)
         scale_param = 0.0
         @inbounds @simd for i in 1:(K+1)
             diff_val = xis_star[i+1] - xis_star[i]
             scale_param += diff_val * diff_val
         end
         scale_param *= 0.5
+        scale_param = max(scale_param, eps(Float64))
         sigma_xi_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         
         # update the sequence
@@ -915,34 +935,38 @@ function RJMCMC_Nonlinear(
 		
         if K > 0
              kc = rand(1:K)
-             zeta_kc_star = rand(Uniform(zetas_star[kc],zetas_star[kc+2]))
-             zetas_star_replace[kc+1] = zeta_kc_star
-             log_de = loglkh_cal(ws, X,Z,Delta,Y, 
-								betas,
-								tau,
-								taus, 
-								gammas,
-								a,b,
-								zetas_star[2:(K+1)],
-								xis_star) +
-                            log(zetas_star[kc+2] - zetas_star[kc+1]) + log(zetas_star[kc+1] - zetas_star[kc])
-            
-             log_num = loglkh_cal(ws, X,Z,Delta,Y, 
+             lower = max(zetas_star[kc], zeta_min)
+             upper = min(zetas_star[kc+2], zeta_max)
+             if lower < upper
+                 zeta_kc_star = rand(Uniform(lower, upper))
+                 zetas_star_replace[kc+1] = zeta_kc_star
+                 log_de = loglkh_cal(ws, X,Z,Delta,Y, 
+                                    betas,
+                                    tau,
+                                    taus, 
+                                    gammas,
+                                    a,b,
+                                    zetas_star[2:(K+1)],
+                                    xis_star) +
+                            log(upper - zetas_star[kc+1]) + log(zetas_star[kc+1] - lower)
+
+                 log_num = loglkh_cal(ws, X,Z,Delta,Y, 
                                         betas,
                                         tau,
                                         taus, 
                                         gammas,
                                         a,b,
-										zetas_star_replace[2:(K+1)],
-										xis_star) + 
-                            log(zetas_star[kc+2] - zeta_kc_star) + log(zeta_kc_star - zetas_star[kc])
-                    
-             aratio = exp(log_num - log_de)
-             acc_prob = min(1, aratio)
-             # accept or not
-             acc = rand() < acc_prob
-             # update the zetas
-             zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1] 
+                                        zetas_star_replace[2:(K+1)],
+                                        xis_star) + 
+                            log(upper - zeta_kc_star) + log(zeta_kc_star - lower)
+                        
+                 aratio = exp(log_num - log_de)
+                 acc_prob = min(1, aratio)
+                 # accept or not
+                 acc = rand() < acc_prob
+                 # update the zetas
+                 zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1]
+             end
         end
     
         # ------------ RJMCMC: Perform RJ-Update for (K, zetas, xis)------------
@@ -965,7 +989,7 @@ function RJMCMC_Nonlinear(
             
                 # sample tau from the unselected observed Z variable
                 #zeta_star = rand(setdiff(Set(zetas_can), Set(zetas_star)))
-                zeta_star = rand(Uniform(a,b))
+                zeta_star = rand(Uniform(zeta_min, zeta_max))
                 
                 # number of data points
                 #D = size(Z)[1]
@@ -981,7 +1005,7 @@ function RJMCMC_Nonlinear(
                           / (zetas_star[k+1] - zetas_star[k]) * log((1-U)/U))
                 # add the new xi into the list
                 xis_star_add = [xis_star[1:k]; xi_star; xis_star[(k+1):(K_star+1)]]
-                
+
                 # acceptance rate
                 log_a_BM = loglkh_cal(ws, X,Z,Delta,Y, 
                                      betas,
@@ -996,9 +1020,9 @@ function RJMCMC_Nonlinear(
                        log(2*K+3) + log(2*K+2) + log(zeta_star-zetas_star[k]) + log(zetas_star[k+1]-zeta_star) + 
                        logpdf_normal(xi_star, xis_star[k], sigma_xi_star) +
                        logpdf_normal(xis_star[k+1], xi_star, sigma_xi_star) - 
-                       2*log(b-a) - log(zetas_star[k+1] - zetas_star[k]) - 
-                       logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
-                       log((1-r_KB)/(K+1)) - log(r_KB_star/(b-a)) - log(U*(1-U)) + log(mu_K) - log(K+1)
+                       2*log(zeta_range) - log(zetas_star[k+1] - zetas_star[k]) +
+                       - logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
+                       log((1-r_KB)/(K+1)) - log(r_KB_star/zeta_range) - log(U*(1-U)) + log(mu_K) - log(K+1)
                 
                 acc_BM_prob = min(1, exp(log_a_BM))
                 
@@ -1045,9 +1069,9 @@ function RJMCMC_Nonlinear(
 
                 # update the calculation of U 1206
 				A_hp1 = (xis_star[k+2]-xis_star[k+1])/(zetas_star[k+2]-zetas_star[k+1])
-				A_h = (xis_star[k+1]-xis_star[k])/(zetas_star[k+1]-zetas_star[k])
-				U = exp(A_h)/(exp(A_h)+exp(A_hp1))
-                
+                A_h = (xis_star[k+1]-xis_star[k])/(zetas_star[k+1]-zetas_star[k])
+                U = exp(A_h)/(exp(A_h)+exp(A_hp1))
+
                 # logarithmic 
                 log_a_DM = loglkh_cal(ws, X,Z,Delta,Y, 
                                      betas,
@@ -1060,13 +1084,13 @@ function RJMCMC_Nonlinear(
                                      a,b,
                                      zetas_star[2:(K+1)],
                                      xis_star)  +
-                           2*log(b-a) + log(zetas_star_rm[k+1]-zetas_star_rm[k]) + 
-                           logpdf_normal(xis_star_rm[k+1], xis_star_rm[k], sigma_xi_star) - 
+                           2*log(zeta_range) + log(zetas_star_rm[k+1]-zetas_star_rm[k]) + 
+                           logpdf_normal(xis_star_rm[k+1], xis_star_rm[k], sigma_xi_star) -
                            log(2*K+1) - log(2*K) - 
-                           log(zetas_star[k+2]-zetas_star[k+1]) - log(zetas_star[k+1]-zetas_star[k]) - 
-                           logpdf_normal(xis_star[k+2], xis_star[k+1], sigma_xi_star) -
-                           logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
-                           log(r_KB/(b-a)) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
+                           log(zetas_star[k+2]-zetas_star[k+1]) - log(zetas_star[k+1]-zetas_star[k]) +
+                           - logpdf_normal(xis_star[k+2], xis_star[k+1], sigma_xi_star) +
+                           - logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
+                           log(r_KB/zeta_range) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
                 
                 acc_DM_prob = min(1, exp(log_a_DM))
                 
@@ -1110,6 +1134,7 @@ function RJMCMC_Nonlinear(
             xis = xis_star
             sigma_xi = sigma_xi_star
         end
+        xis[1] = 0.0
             
         if iter % n_report == 0
     
@@ -1180,27 +1205,39 @@ end
 ##################################################################################################################
 
 # Compute log Dirichlet prior for knot locations
-function log_dirichlet_prior_tau(taus_, alpha_tau, tau)
+function log_dirichlet_prior_tau(taus_, alpha_tau, tau; edge_weight::Float64=1.0)
     H = length(taus_) - 2  # taus_ includes 0 and tau as boundaries
     if H < 0
         return 0.0
     end
     # Compute interval lengths
     deltas = diff(taus_)
-    # Log prior: log Γ((H+1)α) - (H+1)log Γ(α) + (α-1) * Σ log(Δ_h)
-    log_prior = loggamma((H+1) * alpha_tau) - (H+1) * loggamma(alpha_tau) + (alpha_tau - 1) * sum(log.(deltas))
+    # Log prior: log Γ(Σα_i) - Σ log Γ(α_i) + Σ (α_i - 1) log(Δ_h)
+    alpha_edge = edge_weight * alpha_tau
+    alpha_sum = (H - 1) * alpha_tau + 2 * alpha_edge
+    log_prior = loggamma(alpha_sum) - (H - 1) * loggamma(alpha_tau) - 2 * loggamma(alpha_edge)
+    log_prior += (alpha_edge - 1) * (log(deltas[1]) + log(deltas[end]))
+    if H > 1
+        log_prior += (alpha_tau - 1) * sum(log.(deltas[2:(end-1)]))
+    end
     return log_prior
 end
 
-function log_dirichlet_prior_zeta(zetas_, alpha_zeta, a, b)
+function log_dirichlet_prior_zeta(zetas_, alpha_zeta, a, b; edge_weight::Float64=1.0)
     K = length(zetas_) - 2  # zetas_ includes a and b as boundaries
     if K < 0
         return 0.0
     end
     # Compute interval lengths
     deltas = diff(zetas_)
-    # Log prior: log Γ((K+1)α) - (K+1)log Γ(α) + (α-1) * Σ log(Δ_k)
-    log_prior = loggamma((K+1) * alpha_zeta) - (K+1) * loggamma(alpha_zeta) + (alpha_zeta - 1) * sum(log.(deltas))
+    # Log prior: log Γ(Σα_i) - Σ log Γ(α_i) + Σ (α_i - 1) log(Δ_k)
+    alpha_edge = edge_weight * alpha_zeta
+    alpha_sum = (K - 1) * alpha_zeta + 2 * alpha_edge
+    log_prior = loggamma(alpha_sum) - (K - 1) * loggamma(alpha_zeta) - 2 * loggamma(alpha_edge)
+    log_prior += (alpha_edge - 1) * (log(deltas[1]) + log(deltas[end]))
+    if K > 1
+        log_prior += (alpha_zeta - 1) * sum(log.(deltas[2:(end-1)]))
+    end
     return log_prior
 end
 
@@ -1233,6 +1270,25 @@ function RJMCMC_Nonlinear_Dirichlet(
     obs_time = obs_time[obs_time .> 0]
     tau  = maximum(obs_time)
     
+    # Knot location bounds: restrict to [5%, 95%] based on observed Y (events)
+    tau_min = quantile(obs_time, 0.05)
+    tau_max = quantile(obs_time, 0.95)
+    tau_range = tau_max - tau_min
+    if tau_range <= 0.0
+        tau_min = 0.0
+        tau_max = tau
+        tau_range = tau_max - tau_min
+    end
+    # Knot location bounds: restrict to [5%, 95%] based on observed Z
+    zeta_min = quantile(Z, 0.05)
+    zeta_max = quantile(Z, 0.95)
+    zeta_range = zeta_max - zeta_min
+    if zeta_range <= 0.0
+        zeta_min = a
+        zeta_max = b
+        zeta_range = zeta_max - zeta_min
+    end
+
     # prior parameter for number of probability (matching NonLinear1)
     mu_H = mu_K = 1
 
@@ -1287,18 +1343,9 @@ function RJMCMC_Nonlinear_Dirichlet(
     # ------------------ Prior Specification ------------------ 
     Random.seed!(random_seed)
     
-    # Create candidate sets (matching NonLinear1 exactly)
-    Hcan = 20  # Candidate set size for baseline hazard knots
-    Kcan = 20  # Candidate set size for g(z) knots
-    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
-    zetas_can = LinRange(a, b, Kcan+2)[2:(Kcan+1)]
-    
-    # Initialize taus using candidate set method (matching NonLinear1)
-    if H > 0
-        taus = sort(sample(taus_can, H, replace=false))
-    else
-        taus = Float64[]  # Empty when H=0
-    end
+    # Initialize taus/zetas (same strategy as NonLinear1, with Dirichlet prior on locations)
+    edge_weight = 1.0
+    taus = LinRange(tau_min, tau_max, H + 2)[2:(H + 1)]
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -1307,18 +1354,14 @@ function RJMCMC_Nonlinear_Dirichlet(
         gammas[i] = rand(Normal(gammas[i-1],1))
     end  
     
-    # Initialize zetas using candidate set method (matching NonLinear1)
-    if K > 0
-        zetas = sort(sample(zetas_can, K, replace=false))
-    else
-        zetas = Float64[]  # Empty when K=0
-    end
+    # Initialize zetas (same strategy as NonLinear1, with Dirichlet prior on locations)
+    zetas = LinRange(zeta_min, zeta_max, K + 2)[2:(K + 1)]
     zetas_ = [a zetas' b][1,:]
     
     xis = zeros(K+2)
-    xis[1] = 0
+    xis[1] = 0.0
     for i in 2:(K+2)
-        xis[i] = rand(Normal(xis[i-1],1))
+        xis[i] = rand(Normal(xis[i-1], 1))
     end
     
     betas = zeros(dim_beta)
@@ -1359,12 +1402,10 @@ function RJMCMC_Nonlinear_Dirichlet(
         # Pre-compute components that don't change during gamma updates
         mul!(ws.eta, X, betas)
         g_fun_est!(ws.g_values, Z, a, b, zetas, xis, ws.knots_g)
+        fill_knots!(ws.knots_h, 0.0, taus, Float64(tau))
         
         for h in 1:(H+2)        
-            log_prob_de = logpdf_normal(gammas_star[1], 0.0, 5.0)
-            @inbounds for hh in 2:(H+2)
-                log_prob_de += logpdf_normal(gammas_star[hh], gammas_star[hh-1], sigma_gamma)
-            end
+            log_prob_de = log_rw1_prior(gammas_star, sigma_gamma; anchor_first=true, anchor_std=5.0)
             
             # Compute loglambda and Lambda for current gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
@@ -1378,10 +1419,7 @@ function RJMCMC_Nonlinear_Dirichlet(
             gamma_h_new = rand(Uniform(gammas[h]-c_gamma, gammas[h]+c_gamma))
             gammas_star[h] = gamma_h_new
             
-            log_prob_num = logpdf_normal(gammas_star[1], 0.0, 5.0)
-            @inbounds for hh in 2:(H+2)
-                log_prob_num += logpdf_normal(gammas_star[hh], gammas_star[hh-1], sigma_gamma)
-            end
+            log_prob_num = log_rw1_prior(gammas_star, sigma_gamma; anchor_first=true, anchor_std=5.0)
             
             # Recompute loglambda and Lambda for proposed gammas
             loglambda_fun_est!(ws.loglambda_values, Y, tau, taus, gammas_star, ws.knots_h)
@@ -1404,13 +1442,14 @@ function RJMCMC_Nonlinear_Dirichlet(
         
         # ----------------------------- Update Sigma_Gamma -----------------------------
         shape_param = 0.5 * H + 0.5
-        # Optimized: compute sum of squared differences directly
+        # Optimized: compute sum of squared first differences directly (RW1)
         scale_param = 0.0
         @inbounds @simd for i in 1:(H+1)
             diff_val = gammas_star[i+1] - gammas_star[i]
             scale_param += diff_val * diff_val
         end
         scale_param *= 0.5
+        scale_param = max(scale_param, eps(Float64))
         sigma_gamma_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         sigmas_gamma_all[iter] = sigma_gamma_star
         
@@ -1421,23 +1460,29 @@ function RJMCMC_Nonlinear_Dirichlet(
                 
         if H > 0
             hc = rand(1:H)
-            tau_hc_star = rand(Uniform(taus_star[hc], taus_star[hc+2]))
-            taus_star_replace[hc+1] = tau_hc_star
+            lower = max(taus_star[hc], tau_min)
+            upper = min(taus_star[hc+2], tau_max)
+            if lower < upper
+                tau_hc_star = rand(Uniform(lower, upper))
+                taus_star_replace[hc+1] = tau_hc_star
             
-            # Log-likelihood ratio
-            log_lik_de = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis)
-            log_lik_num = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star_replace[2:(H+1)], gammas_star, a,b,zetas,xis)
-            
-            # Dirichlet prior ratio (Eq. 3 in supplement)
-            log_prior_de = (alpha_tau - 1) * (log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc]))
-            log_prior_num = (alpha_tau - 1) * (log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc]))
-            
-            log_ratio = (log_lik_num - log_lik_de) + (log_prior_num - log_prior_de)
-            
-            aratio = exp(log_ratio)
-            acc_prob = min(1, aratio)
-            acc = rand() < acc_prob
-            taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1]
+            # Dirichlet prior terms (edge-weighted)
+            log_prior_de = log_dirichlet_prior_tau(taus_star, alpha_tau, tau; edge_weight=edge_weight)
+            log_prior_num = log_dirichlet_prior_tau(taus_star_replace, alpha_tau, tau; edge_weight=edge_weight)
+
+                log_de = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis) +
+                         log(upper - taus_star[hc+1]) + log(taus_star[hc+1] - lower) +
+                         log_prior_de
+
+                log_num = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star_replace[2:(H+1)], gammas_star, a,b,zetas,xis) +
+                          log(upper - tau_hc_star) + log(tau_hc_star - lower) +
+                          log_prior_num
+                
+                aratio = exp(log_num - log_de)
+                acc_prob = min(1, aratio)
+                acc = rand() < acc_prob
+                taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1]
+            end
         end
         
         # ----------------------------- RJMCMC for H (with Dirichlet prior) -----------------------------
@@ -1455,7 +1500,7 @@ function RJMCMC_Nonlinear_Dirichlet(
         if RJMCMC_indicator
             if H_star > H
                 # ------------ Birth Move (Eq. 4 in supplement) ------------
-                tau_star_new = rand(Uniform(0, tau))
+                tau_star_new = rand(Uniform(tau_min, tau_max))
                 taus_star_add = sort([taus_star; tau_star_new])
                 
                 h = sum(taus_star .< tau_star_new)
@@ -1464,21 +1509,19 @@ function RJMCMC_Nonlinear_Dirichlet(
                 gamma_star = gammas_star[h] + (tau_star_new - taus_star[h]) * (Ah - (taus_star[h+1] - tau_star_new) / (taus_star[h+1] - taus_star[h]) * log((1-U)/U))
                 gammas_star_add = [gammas_star[1:h]; gamma_star; gammas_star[(h+1):(H_star+1)]]
                 
-                # Dirichlet prior ratio for birth (Eq. 4)
-                Delta_j_old = taus_star[h+1] - taus_star[h]
-                Delta_j_new = tau_star_new - taus_star[h]
-                Delta_jp1_new = taus_star[h+1] - tau_star_new
-                
-                log_prior_ratio = loggamma((H+2) * alpha_tau) - loggamma((H+1) * alpha_tau) - loggamma(alpha_tau) +
-                                  (alpha_tau - 1) * (log(Delta_j_new) + log(Delta_jp1_new) - log(Delta_j_old))
+                # Dirichlet prior ratio for birth (edge-weighted)
+                log_prior_ratio = log_dirichlet_prior_tau(taus_star_add, alpha_tau, tau; edge_weight=edge_weight) -
+                                  log_dirichlet_prior_tau(taus_star, alpha_tau, tau; edge_weight=edge_weight)
                 
                 log_a_BM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star_add[2:(H_star+1)], gammas_star_add, a,b,zetas,xis) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis) +
-                           log_prior_ratio +
+                           log(2*H+3) + log(2*H+2) + log(tau_star_new - taus_star[h]) + log(taus_star[h+1] - tau_star_new) +
                            logpdf_normal(gamma_star, gammas_star[h], sigma_gamma_star) +
                            logpdf_normal(gammas_star[h+1], gamma_star, sigma_gamma_star) -
+                           2*log(tau_range) - log(taus_star[h+1] - taus_star[h]) -
                            logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
-                           log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
+                           log_prior_ratio +
+                           log((1-r_HB)/(H+1)) - log(r_HB_star/tau_range) - log(U*(1-U)) + log(mu_H) - log(H+1)
                 
                 acc_BM_prob = min(1, exp(log_a_BM))
                 acc_MHM = rand() < acc_BM_prob
@@ -1512,21 +1555,20 @@ function RJMCMC_Nonlinear_Dirichlet(
                 A_h = (gammas_star[h+1]-gammas_star[h])/(taus_star[h+1]-taus_star[h])
                 U = exp(A_h)/(exp(A_h)+exp(A_hp1))
                 
-                # Dirichlet prior ratio for death (Eq. 5)
-                Delta_j_old = taus_star[h+1] - taus_star[h]
-                Delta_jp1_old = taus_star[h+2] - taus_star[h+1]
-                Delta_j_new = taus_star_rm[h+1] - taus_star_rm[h]
-                
-                log_prior_ratio = loggamma(H * alpha_tau) + loggamma(alpha_tau) - loggamma((H+1) * alpha_tau) +
-                                  (alpha_tau - 1) * (log(Delta_j_new) - log(Delta_j_old) - log(Delta_jp1_old))
+                # Dirichlet prior ratio for death (edge-weighted)
+                log_prior_ratio = log_dirichlet_prior_tau(taus_star_rm, alpha_tau, tau; edge_weight=edge_weight) -
+                                  log_dirichlet_prior_tau(taus_star, alpha_tau, tau; edge_weight=edge_weight)
                 
                 log_a_DM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star_rm[2:(H_star+1)], gammas_star_rm, a,b,zetas,xis) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus_star[2:(H+1)], gammas_star, a,b,zetas,xis) +
-                           log_prior_ratio +
-                           logpdf_normal(gammas_star_rm[h+1], gammas_star_rm[h], sigma_gamma_star) - 
+                           2*log(tau_range) + log(taus_star_rm[h+1]-taus_star_rm[h]) +
+                           logpdf_normal(gammas_star_rm[h+1], gammas_star_rm[h], sigma_gamma_star) -
+                           log(2*H+1) - log(2*H) -
+                           log(taus_star[h+2]-taus_star[h+1]) - log(taus_star[h+1]-taus_star[h]) -
                            logpdf_normal(gammas_star[h+2], gammas_star[h+1], sigma_gamma_star) -
                            logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
-                           log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
+                           log_prior_ratio +
+                           log(r_HB/tau_range) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
         
                 acc_DM_prob = min(1, exp(log_a_DM))
                 acc_MHM = rand() < acc_DM_prob
@@ -1622,6 +1664,7 @@ function RJMCMC_Nonlinear_Dirichlet(
         @inbounds @simd for i in eachindex(ws.eta)
             ws.Xbeta_plus_g[i] = ws.eta[i] + ws.g_values[i]
         end
+        fill_knots!(ws.knots_g, Float64(a), zetas, Float64(b))
     
         for k in 2:(K+2)        
             # Save current state before proposing (needed for rejection case)
@@ -1629,10 +1672,7 @@ function RJMCMC_Nonlinear_Dirichlet(
             # updated by previous accepted proposals in this loop
             xi_k_current = xis_star[k]
             
-            log_prob_de = 0.0
-            @inbounds for kk in 2:(K+2)
-                log_prob_de += logpdf_normal(xis_star[kk], xis_star[kk-1], sigma_xi)
-            end
+            log_prob_de = log_rw1_xi_prior(xis_star, sigma_xi)
     
             log_de = log_prob_de + compute_loglkh_optimized(Delta, ws.loglambda_values, ws.Xbeta_plus_g, ws.Lambda_values)
             
@@ -1640,10 +1680,7 @@ function RJMCMC_Nonlinear_Dirichlet(
             xi_k_new = rand(Uniform(xis[k]-c_xi, xis[k]+c_xi))
             xis_star[k] = xi_k_new
             
-            log_prob_num = 0.0
-            @inbounds for kk in 2:(K+2)
-                log_prob_num += logpdf_normal(xis_star[kk], xis_star[kk-1], sigma_xi)
-            end
+            log_prob_num = log_rw1_xi_prior(xis_star, sigma_xi)
             
             # Only recompute g_values (xi changed)
             g_fun_est!(ws.g_values, Z, a, b, zetas, xis_star, ws.knots_g)
@@ -1670,13 +1707,14 @@ function RJMCMC_Nonlinear_Dirichlet(
         
         # ----------------------------- Update Sigma_Xi -----------------------------
         shape_param = 0.5 * K + 0.5
-        # Optimized: compute sum of squared differences directly
+        # Optimized: compute sum of squared first differences directly (RW1)
         scale_param = 0.0
         @inbounds @simd for i in 1:(K+1)
             diff_val = xis_star[i+1] - xis_star[i]
             scale_param += diff_val * diff_val
         end
         scale_param *= 0.5
+        scale_param = max(scale_param, eps(Float64))
         sigma_xi_star = sqrt(rand(InverseGamma(shape_param, scale_param)))
         sigmas_xi_all[iter] = sigma_xi_star
         
@@ -1687,23 +1725,32 @@ function RJMCMC_Nonlinear_Dirichlet(
 		
         if K > 0
             kc = rand(1:K)
-            zeta_kc_star = rand(Uniform(zetas_star[kc], zetas_star[kc+2]))
-            zetas_star_replace[kc+1] = zeta_kc_star
+            lower = max(zetas_star[kc], zeta_min)
+            upper = min(zetas_star[kc+2], zeta_max)
+            if lower < upper
+                zeta_kc_star = rand(Uniform(lower, upper))
+                zetas_star_replace[kc+1] = zeta_kc_star
             
             # Log-likelihood ratio
             log_lik_de = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus, gammas, a,b, zetas_star[2:(K+1)], xis_star)
             log_lik_num = loglkh_cal(ws, X,Z,Delta,Y, betas, tau, taus, gammas, a,b, zetas_star_replace[2:(K+1)], xis_star)
             
-            # Dirichlet prior ratio
-            log_prior_de = (alpha_zeta - 1) * (log(zetas_star[kc+2] - zetas_star[kc+1]) + log(zetas_star[kc+1] - zetas_star[kc]))
-            log_prior_num = (alpha_zeta - 1) * (log(zetas_star[kc+2] - zeta_kc_star) + log(zeta_kc_star - zetas_star[kc]))
-            
-            log_ratio = (log_lik_num - log_lik_de) + (log_prior_num - log_prior_de)
-            
-            aratio = exp(log_ratio)
-            acc_prob = min(1, aratio)
-            acc = rand() < acc_prob
-            zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1]
+            # Dirichlet prior ratio (edge-weighted)
+            log_prior_de = log_dirichlet_prior_zeta(zetas_star, alpha_zeta, a, b; edge_weight=edge_weight)
+            log_prior_num = log_dirichlet_prior_zeta(zetas_star_replace, alpha_zeta, a, b; edge_weight=edge_weight)
+
+                log_de = log_lik_de +
+                         log(upper - zetas_star[kc+1]) + log(zetas_star[kc+1] - lower) +
+                         log_prior_de
+                log_num = log_lik_num +
+                          log(upper - zeta_kc_star) + log(zeta_kc_star - lower) +
+                          log_prior_num
+                
+                aratio = exp(log_num - log_de)
+                acc_prob = min(1, aratio)
+                acc = rand() < acc_prob
+                zetas_star[kc+1] = acc * zeta_kc_star + (1-acc) * zetas_[kc+1]
+            end
         end
     
         # ----------------------------- RJMCMC for K (with Dirichlet prior) -----------------------------
@@ -1721,7 +1768,7 @@ function RJMCMC_Nonlinear_Dirichlet(
         if RJMCMC_indicator
             if K_star > K
                 # ------------ Birth Move for zeta ------------
-                zeta_star_new = rand(Uniform(a, b))
+                zeta_star_new = rand(Uniform(zeta_min, zeta_max))
                 zetas_star_add = sort([zetas_star; zeta_star_new])
                 
                 k = sum(zetas_star .< zeta_star_new)
@@ -1729,23 +1776,20 @@ function RJMCMC_Nonlinear_Dirichlet(
                 U = rand()
                 xi_star = xis_star[k] + (zeta_star_new - zetas_star[k]) * (Ak - (zetas_star[k+1] - zeta_star_new) / (zetas_star[k+1] - zetas_star[k]) * log((1-U)/U))
                 xis_star_add = [xis_star[1:k]; xi_star; xis_star[(k+1):(K_star+1)]]
-                
-                # Dirichlet prior ratio for birth
-                Delta_k_old = zetas_star[k+1] - zetas_star[k]
-                Delta_k_new = zeta_star_new - zetas_star[k]
-                Delta_kp1_new = zetas_star[k+1] - zeta_star_new
-                
-                log_prior_ratio = loggamma((K+2) * alpha_zeta) - loggamma((K+1) * alpha_zeta) - loggamma(alpha_zeta) +
-                                  (alpha_zeta - 1) * (log(Delta_k_new) + log(Delta_kp1_new) - log(Delta_k_old))
+
+                # Dirichlet prior ratio for birth (edge-weighted)
+                log_prior_ratio = log_dirichlet_prior_zeta(zetas_star_add, alpha_zeta, a, b; edge_weight=edge_weight) -
+                                  log_dirichlet_prior_zeta(zetas_star, alpha_zeta, a, b; edge_weight=edge_weight)
                 
                 log_a_BM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star_add[2:(K_star+1)], xis_star_add) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star[2:(K+1)], xis_star) +
-                           log_prior_ratio +
+                           log(2*K+3) + log(2*K+2) + log(zeta_star_new-zetas_star[k]) + log(zetas_star[k+1]-zeta_star_new) +
                            logpdf_normal(xi_star, xis_star[k], sigma_xi_star) +
-                           logpdf_normal(xis_star[k+1], xi_star, sigma_xi_star) - 
+                           logpdf_normal(xis_star[k+1], xi_star, sigma_xi_star) -
+                           2*log(zeta_range) - log(zetas_star[k+1] - zetas_star[k]) -
                            logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
-                           log((1-r_KB)/(K+1)) - log(r_KB_star/(b-a)) - log(U*(1-U)) + log(mu_K) - log(K+1)
-                
+                           log_prior_ratio +
+                           log((1-r_KB)/(K+1)) - log(r_KB_star/zeta_range) - log(U*(1-U)) + log(mu_K) - log(K+1)
                 acc_BM_prob = min(1, exp(log_a_BM))
                 acc_MHM = rand() < acc_BM_prob
             
@@ -1778,21 +1822,20 @@ function RJMCMC_Nonlinear_Dirichlet(
                 A_k = (xis_star[k+1]-xis_star[k])/(zetas_star[k+1]-zetas_star[k])
                 U = exp(A_k)/(exp(A_k)+exp(A_kp1))
                 
-                # Dirichlet prior ratio for death
-                Delta_k_old = zetas_star[k+1] - zetas_star[k]
-                Delta_kp1_old = zetas_star[k+2] - zetas_star[k+1]
-                Delta_k_new = zetas_star_rm[k+1] - zetas_star_rm[k]
-                
-                log_prior_ratio = loggamma(K * alpha_zeta) + loggamma(alpha_zeta) - loggamma((K+1) * alpha_zeta) +
-                                  (alpha_zeta - 1) * (log(Delta_k_new) - log(Delta_k_old) - log(Delta_kp1_old))
-                
+                # Dirichlet prior ratio for death (edge-weighted)
+                log_prior_ratio = log_dirichlet_prior_zeta(zetas_star_rm, alpha_zeta, a, b; edge_weight=edge_weight) -
+                                  log_dirichlet_prior_zeta(zetas_star, alpha_zeta, a, b; edge_weight=edge_weight)
+
                 log_a_DM = loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star_rm[2:(K_star+1)], xis_star_rm) - 
                            loglkh_cal(ws, X,Z,Delta,Y, betas, tau,taus,gammas, a,b, zetas_star[2:(K+1)], xis_star) +
-                           log_prior_ratio +
-                           logpdf_normal(xis_star_rm[k+1], xis_star_rm[k], sigma_xi_star) - 
+                           2*log(zeta_range) + log(zetas_star_rm[k+1]-zetas_star_rm[k]) +
+                           logpdf_normal(xis_star_rm[k+1], xis_star_rm[k], sigma_xi_star) -
+                           log(2*K+1) - log(2*K) -
+                           log(zetas_star[k+2]-zetas_star[k+1]) - log(zetas_star[k+1]-zetas_star[k]) -
                            logpdf_normal(xis_star[k+2], xis_star[k+1], sigma_xi_star) -
                            logpdf_normal(xis_star[k+1], xis_star[k], sigma_xi_star) +
-                           log(r_KB/(b-a)) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
+                           log_prior_ratio +
+                           log(r_KB/zeta_range) - log((1-r_KB_star)/K) + log(U*(1-U)) + log(K) - log(mu_K)
                 
                 acc_DM_prob = min(1, exp(log_a_DM))
                 acc_MHM = rand() < acc_DM_prob
@@ -1829,25 +1872,21 @@ function RJMCMC_Nonlinear_Dirichlet(
             xis = xis_star
             sigma_xi = sigma_xi_star
         end
+        xis[1] = 0.0
         
         # ----------------------------- Update alpha_tau (Eq. 6 in supplement) -----------------------------
         taus_ = [0.0; taus; tau]
         if H >= 0
             S_tau = sum(log.(diff(taus_)))
-            
-            # Propose on log-scale
-            log_alpha_tau = log(alpha_tau)
-            log_alpha_tau_star = rand(Normal(log_alpha_tau, c_alpha))
-            alpha_tau_star = exp(log_alpha_tau_star)
-            
-            # Log acceptance ratio (Eq. 7)
-            log_r_alpha = (a_tau - 1) * (log_alpha_tau_star - log_alpha_tau) - 
-                          b_tau * (alpha_tau_star - alpha_tau) +
-                          loggamma((H+1) * alpha_tau_star) - loggamma((H+1) * alpha_tau) -
+
+            # Propose directly from the prior (independence sampler)
+            alpha_tau_star = rand(Gamma(a_tau, 1 / b_tau))
+
+            # Log acceptance ratio (prior cancels proposal)
+            log_r_alpha = loggamma((H+1) * alpha_tau_star) - loggamma((H+1) * alpha_tau) -
                           (H+1) * (loggamma(alpha_tau_star) - loggamma(alpha_tau)) +
-                          (alpha_tau_star - alpha_tau) * S_tau +
-                          (log_alpha_tau_star - log_alpha_tau)  # Jacobian
-            
+                          (alpha_tau_star - alpha_tau) * S_tau
+
             if rand() < min(1, exp(log_r_alpha))
                 alpha_tau = alpha_tau_star
             end
@@ -1858,18 +1897,15 @@ function RJMCMC_Nonlinear_Dirichlet(
         zetas_ = [a; zetas; b]
         if K >= 0
             S_zeta = sum(log.(diff(zetas_)))
-            
-            log_alpha_zeta = log(alpha_zeta)
-            log_alpha_zeta_star = rand(Normal(log_alpha_zeta, c_alpha))
-            alpha_zeta_star = exp(log_alpha_zeta_star)
-            
-            log_r_alpha = (a_zeta - 1) * (log_alpha_zeta_star - log_alpha_zeta) - 
-                          b_zeta * (alpha_zeta_star - alpha_zeta) +
-                          loggamma((K+1) * alpha_zeta_star) - loggamma((K+1) * alpha_zeta) -
+
+            # Propose directly from the prior (independence sampler)
+            alpha_zeta_star = rand(Gamma(a_zeta, 1 / b_zeta))
+
+            # Log acceptance ratio (prior cancels proposal)
+            log_r_alpha = loggamma((K+1) * alpha_zeta_star) - loggamma((K+1) * alpha_zeta) -
                           (K+1) * (loggamma(alpha_zeta_star) - loggamma(alpha_zeta)) +
-                          (alpha_zeta_star - alpha_zeta) * S_zeta +
-                          (log_alpha_zeta_star - log_alpha_zeta)
-            
+                          (alpha_zeta_star - alpha_zeta) * S_zeta
+
             if rand() < min(1, exp(log_r_alpha))
                 alpha_zeta = alpha_zeta_star
             end
@@ -1941,8 +1977,8 @@ mutable struct CoxPHWorkspace
     eta::Vector{Float64}
     knots_h::Vector{Float64}
     cumhaz_h::Vector{Float64}
-    loglambda_values::Vector{Float64}  # logλ(Y) values (pre-allocated)
-    Lambda_values::Vector{Float64}     # Λ(Y) values (pre-allocated)
+    loglambda_values::Vector{Float64}  # loglambda(Y) values (pre-allocated)
+    Lambda_values::Vector{Float64}     # Lambda(Y) values (pre-allocated)
 end
 
 function CoxPHWorkspace(n::Integer, Hmax::Integer)
@@ -2013,6 +2049,16 @@ function RJMCMC_CoxPH(
     obs_time = (Y .* Delta) 
     obs_time = obs_time[obs_time .> 0]
     tau = maximum(obs_time)+1e-5
+
+    # Knot location bounds: restrict to [5%, 95%] based on observed Y (events)
+    tau_min = quantile(obs_time, 0.05)
+    tau_max = quantile(obs_time, 0.95)
+    tau_range = tau_max - tau_min
+    if tau_range <= 0.0
+        tau_min = 0.0
+        tau_max = tau
+        tau_range = tau_max - tau_min
+    end
     
     # prior parameter for number of probability
     mu_H = 1
@@ -2062,16 +2108,9 @@ function RJMCMC_CoxPH(
     
     Random.seed!(random_seed)
     
-    # Create candidate sets (matching NonLinear1 exactly)
-    Hcan = 20  # Candidate set size for baseline hazard knots
-    taus_can = LinRange(0, tau, Hcan+2)[2:(Hcan+1)]
-    
-    # prior: baseline hazard using candidate set method (matching NonLinear1)
-    if H > 0
-        taus = sort(sample(taus_can, H, replace=false))
-    else
-        taus = Float64[]  # Empty when H=0
-    end
+    # prior: baseline hazard
+    # equally spaced taus, restricted to [tau_min, tau_max]
+    taus = LinRange(tau_min, tau_max, H + 2)[2:(H + 1)]
     taus_ = [0 taus' tau][1,:]
     
     gammas = zeros(H+2)
@@ -2174,28 +2213,32 @@ function RJMCMC_CoxPH(
 
 		if H > 0
              hc = rand(1:H)
-             tau_hc_star = rand(Uniform(taus_star[hc],taus_star[hc+2]))
-             taus_star_replace[hc+1] = tau_hc_star
-             log_de = coxph_loglkh_cal(ws, X,Delta,Y,  
+             lower = max(taus_star[hc], tau_min)
+             upper = min(taus_star[hc+2], tau_max)
+             if lower < upper
+                 tau_hc_star = rand(Uniform(lower, upper))
+                 taus_star_replace[hc+1] = tau_hc_star
+                 log_de = coxph_loglkh_cal(ws, X,Delta,Y,  
 								betas,
 								tau,
 								taus_star[2:(H+1)], 
 								gammas_star) +
-                            log(taus_star[hc+2] - taus_star[hc+1]) + log(taus_star[hc+1] - taus_star[hc])
+                            log(upper - taus_star[hc+1]) + log(taus_star[hc+1] - lower)
             
-             log_num = coxph_loglkh_cal(ws, X,Delta,Y, 
+                 log_num = coxph_loglkh_cal(ws, X,Delta,Y, 
 								betas,
 								tau,
 								taus_star_replace[2:(H+1)], 
 								gammas_star) + 
-                            log(taus_star[hc+2] - tau_hc_star) + log(tau_hc_star - taus_star[hc])
+                            log(upper - tau_hc_star) + log(tau_hc_star - lower)
                     
-             aratio = exp(log_num - log_de)
-             acc_prob = min(1, aratio)
-             # accept or not
-             acc = rand() < acc_prob
-             # update the taus
-             taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1] 
+                 aratio = exp(log_num - log_de)
+                 acc_prob = min(1, aratio)
+                 # accept or not
+                 acc = rand() < acc_prob
+                 # update the taus
+                 taus_star[hc+1] = acc * tau_hc_star + (1-acc) * taus_[hc+1]
+             end
         end
         
         
@@ -2218,7 +2261,7 @@ function RJMCMC_CoxPH(
                 # ------------ codes for H_star > H (generate a new knot) ------------
             
                 # sample tau from the unselected observed time
-                tau_star = rand(Uniform(0,tau))
+                tau_star = rand(Uniform(tau_min, tau_max))
                 
                 # merge new tau into a new list 
                 taus_star_add = sort([taus_star; tau_star])
@@ -2246,9 +2289,9 @@ function RJMCMC_CoxPH(
                        log(2*H+3) + log(2*H+2) + log(tau_star-taus_star[h]) + log(taus_star[h+1]-tau_star) + 
                        logpdf_normal(gamma_star, gammas_star[h], sigma_gamma_star) +
                        logpdf_normal(gammas_star[h+1], gamma_star, sigma_gamma_star) - 
-                       2*log(tau) - log(taus_star[h+1] - taus_star[h]) - 
+                       2*log(tau_range) - log(taus_star[h+1] - taus_star[h]) - 
                        logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
-                       log((1-r_HB)/(H+1)) - log(r_HB_star/tau) - log(U*(1-U)) + log(mu_H) - log(H+1)
+                       log((1-r_HB)/(H+1)) - log(r_HB_star/tau_range) - log(U*(1-U)) + log(mu_H) - log(H+1)
     
                 acc_BM_prob = min(1, exp(log_a_BM))
                 
@@ -2307,13 +2350,13 @@ function RJMCMC_CoxPH(
                                     tau,
                                     taus_star[2:(H+1)], 
                                     gammas_star) + 
-                       2*log(tau) + log(taus_star_rm[h+1]-taus_star_rm[h]) + 
+                       2*log(tau_range) + log(taus_star_rm[h+1]-taus_star_rm[h]) + 
                        logpdf_normal(gammas_star_rm[h+1], gammas_star_rm[h], sigma_gamma_star) - 
                        log(2*H+1) - log(2*H) - 
                        log(taus_star[h+2]-taus_star[h+1]) - log(taus_star[h+1]-taus_star[h]) - 
                        logpdf_normal(gammas_star[h+2], gammas_star[h+1], sigma_gamma_star) -
                        logpdf_normal(gammas_star[h+1], gammas_star[h], sigma_gamma_star) +
-                       log(r_HB/tau) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
+                       log(r_HB/tau_range) - log((1-r_HB_star)/H) + log(U*(1-U)) + log(H) - log(mu_H)
                 
                 acc_DM_prob = min(1, exp(log_a_DM))
                 
@@ -2456,7 +2499,7 @@ function St_pred(t,
     a, b, tau = results["a"], results["b"], results["tau"]
 
     ns = get(results, "ns", size(betas_all, 2))
-    bi = get(results, "burn_in", ns ÷ 2)
+    bi = get(results, "burn_in", div(ns, 2))
     n_samples = ns - bi
     n_t = length(t)
 
@@ -2523,7 +2566,7 @@ function St_pred_mean_only!(ws::StPredMeanWorkspace,
     a, b, tau = results["a"], results["b"], results["tau"]
 
     ns = get(results, "ns", size(betas_all, 2))
-    bi = get(results, "burn_in", ns ÷ 2)
+    bi = get(results, "burn_in", div(ns, 2))
     n_t = length(t)
     if length(ws.St_sum) != n_t
         ws.St_sum = zeros(Float64, n_t)
@@ -2532,7 +2575,7 @@ function St_pred_mean_only!(ws::StPredMeanWorkspace,
     end
     
     # Sparse sampling: only use every 'thin'-th sample for faster computation
-    # This reduces computation by thin× while maintaining accuracy
+    # This reduces computation by the thinning factor while maintaining accuracy.
     count = 0
     for i in (bi+1):ns
         if (i - bi - 1) % thin != 0
@@ -2557,8 +2600,8 @@ function St_pred_mean_only!(ws::StPredMeanWorkspace,
             if tj > tau
                 tj = Float64(tau)
             end
-            Λ = cumhaz_at(tj, ws.knots_h_buf, ws.cumhaz_buf, gammas_view, len_h)
-            ws.St_sum[j] += exp(-exp_Xbeta_plus_g * Λ)
+            lambda_val = cumhaz_at(tj, ws.knots_h_buf, ws.cumhaz_buf, gammas_view, len_h)
+            ws.St_sum[j] += exp(-exp_Xbeta_plus_g * lambda_val)
         end
     end
     
@@ -2585,7 +2628,7 @@ function coxph_St_pred(t,
     tau = results["tau"]
 
     ns = get(results, "ns", size(betas_all, 2))
-    bi = get(results, "burn_in", ns ÷ 2)
+    bi = get(results, "burn_in", div(ns, 2))
     n_samples = ns - bi
     n_t = length(t)
 
@@ -2639,7 +2682,7 @@ function coxph_St_pred_mean_only!(ws::CoxPredMeanWorkspace,
     tau = results["tau"]
 
     ns = get(results, "ns", size(betas_all, 2))
-    bi = get(results, "burn_in", ns ÷ 2)
+    bi = get(results, "burn_in", div(ns, 2))
     n_t = length(t)
 
     if length(ws.St_sum) != n_t
@@ -2674,8 +2717,8 @@ function coxph_St_pred_mean_only!(ws::CoxPredMeanWorkspace,
             if tj > tau
                 tj = Float64(tau)
             end
-            Λ = cumhaz_at(tj, ws.knots_h_buf, ws.cumhaz_buf, gammas_view, len_h)
-            ws.St_sum[j] += exp(-exp_Xbeta_plus_Z * Λ)
+            lambda_val = cumhaz_at(tj, ws.knots_h_buf, ws.cumhaz_buf, gammas_view, len_h)
+            ws.St_sum[j] += exp(-exp_Xbeta_plus_Z * lambda_val)
         end
     end
 
@@ -2691,7 +2734,7 @@ function coxph_St_pred_mean_only(t, X_, Z_, results)
     return coxph_St_pred_mean_only!(ws, t, X_, Z_, results)
 end
 
-# Kaplan–Meier estimator at time t (used for IBS weighting).
+# Kaplan-Meier estimator at time t (used for IBS weighting).
 function KM_est(t,Y,Delta)
     sort_idx = sortperm(Y)
     Y = Y[sort_idx]
@@ -2762,7 +2805,7 @@ function KM_est_batch(times::Vector{Float64}, Y::Vector{Float64}, Delta)
 end
 
 # Integrated Brier Score with inverse-probability-of-censoring weighting.
-# Optimized version: matches model0109.jl logic but uses batch KM computation for speed
+# Optimized version: uses batch KM computation for speed
 function IBS(Y_train, Delta_train, 
               X_train, Z_train, 
               Y_test, Delta_test,
@@ -2798,9 +2841,9 @@ function IBS(Y_train, Delta_train,
     end
  
     # Aggressive importance sampling strategy for IBS calculation
-    # Inspired by model1229.jl: use event times + adaptive grid for maximum speedup
+    # Use event times plus an adaptive grid to reduce integration cost.
     ns = get(results, "ns", size(results["betas"], 2))
-    bi = get(results, "burn_in", ns ÷ 2)
+    bi = get(results, "burn_in", div(ns, 2))
     n_samples = ns - bi
     
     # Optimized thinning strategy for NS=10000 (n_samples=5000)
@@ -2857,7 +2900,7 @@ function IBS(Y_train, Delta_train,
         Z_ = Float64(Z_test[i_dag])
         
         # Aggressive importance sampling: prioritize event times for ALL n_int values
-        # Strategy inspired by model1229.jl: use actual event times as primary sampling points
+        # Use actual event times as primary sampling points for IBS integration.
         # This dramatically reduces computation while maintaining accuracy
         
         # Always use event times when available, regardless of n_int
