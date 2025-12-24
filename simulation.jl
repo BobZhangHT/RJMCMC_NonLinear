@@ -811,7 +811,7 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                     g_mean = vec(mean(g_mat, dims=2))
 
                     # Legend position: topleft for linear, topright for others
-                    legend_pos_g = (g_type == "linear") ? :topleft : :topright
+                    legend_pos_g = (g_type == "linear") ? :topleft : (g_type == "quad" ? :bottom : :topright)
                     
                     plt_g = plot(z_grid, g_truth; lw=2, color=:black, label="True", legend=legend_pos_g)
                     plot!(plt_g, z_grid, g_mean; lw=2, color=:red, linestyle=:dot, label="NonLinear1")
@@ -825,6 +825,7 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                     xlabel!(plt_g, "z")
                     ylabel!(plt_g, "g(z)")
                     title!(plt_g, "n = $(n)")
+                    plot!(plt_g; tickfontsize=14, xguidefontsize=16, yguidefontsize=16, legendfontsize=10, titlefontsize=16)
                     savefig(plt_g, joinpath(plots_dir, "g_$(g_type)_n$(n).pdf"))
                 end
 
@@ -844,7 +845,10 @@ function summarize_tasks(cfg::SimulationConfig, base_dir::String)
                     
                     xlabel!(plt_lam, "t")
                     ylabel!(plt_lam, "Lambda(t)")
+                    xlims!(plt_lam, (0, 1.5))
                     title!(plt_lam, "n = $(n)")
+                    ylims!(plt_lam, (0, 2))
+                    plot!(plt_lam; tickfontsize=14, xguidefontsize=16, yguidefontsize=16, legendfontsize=10, titlefontsize=16)
                     savefig(plt_lam, joinpath(plots_dir, "lambda_$(g_type)_n$(n).pdf"))
                 end
             end
@@ -989,10 +993,12 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                     plot!(p_lam[i], cfg.t_grid, baseline,
                           xlabel=L"$t$", ylabel=L"$\Lambda(t)$", margin=10Plots.mm,
                           label="True", color=:black, lw=2, title="n = $(n)", 
-                          xlim=(0, 2.5), ylim=(0, 5),
-                          tickfontsize=12,
-                          xguidefontsize=14,
-                          yguidefontsize=14,
+                          xlim=(0, 1.5), ylim=(0, 2),
+                          tickfontsize=14,
+                          xguidefontsize=16,
+                          yguidefontsize=16,
+                          legendfontsize=10,
+                          titlefontsize=16,
                           legend=:topleft)
                     if has_non1
                         plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
@@ -1004,10 +1010,11 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                     plot!(p_lam[i], cfg.t_grid, baseline,
                           xlabel=L"$t$", ylabel=L"$\Lambda(t)$", margin=10Plots.mm,
                           label="", color=:black, lw=2, title="n = $(n)",
-                          xlim=(0, 2.5), ylim=(0, 5),
-                          tickfontsize=12,
-                          xguidefontsize=14,
-                          yguidefontsize=14)
+                          xlim=(0, 1.5), ylim=(0, 2),
+                          tickfontsize=14,
+                          xguidefontsize=16,
+                          yguidefontsize=16,
+                          titlefontsize=16)
                     if has_non1
                         plot!(p_lam[i], cfg.t_grid, lam_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
                     end
@@ -1047,15 +1054,17 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                 end
                 
                 # Legend position: topleft for linear, topright for others
-                legend_pos_g = (g_type == "linear") ? :topleft : :topright
+                legend_pos_g = (g_type == "linear") ? :topleft : (g_type == "quad" ? :bottom : :topright)
                 
                 if i == 1
                     plot!(p_g[i], cfg.z_grid, g_true,
                           xlabel=L"$z$", ylabel=L"$g(z)$", margin=10Plots.mm,
                           label="True", color=:black, lw=2, title="n = $(n)",
-                          tickfontsize=12,
-                          xguidefontsize=14,
-                          yguidefontsize=14,
+                          tickfontsize=14,
+                          xguidefontsize=16,
+                          yguidefontsize=16,
+                          legendfontsize=10,
+                          titlefontsize=16,
                           legend=legend_pos_g)
                     if has_non1
                         plot!(p_g[i], cfg.z_grid, g_non1_avg, label="NonLinear1", color=:red, lw=2, linestyle=:dot)
@@ -1067,9 +1076,10 @@ function generate_manuscript_plots(cfg::SimulationConfig, base_dir::String)
                     plot!(p_g[i], cfg.z_grid, g_true,
                           xlabel=L"$z$", ylabel=L"$g(z)$", margin=10Plots.mm,
                           label="", color=:black, lw=2, title="n = $(n)",
-                          tickfontsize=12,
-                          xguidefontsize=14,
-                          yguidefontsize=14)
+                          tickfontsize=14,
+                          xguidefontsize=16,
+                          yguidefontsize=16,
+                          titlefontsize=16)
                     if has_non1
                         plot!(p_g[i], cfg.z_grid, g_non1_avg, label="", color=:red, lw=2, linestyle=:dot)
                     end

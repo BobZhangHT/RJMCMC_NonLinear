@@ -4,7 +4,7 @@ Julia implementation of reversible jump MCMC survival models for simulations and
 
 ## Features
 
-- **Three RJMCMC Methods**: 
+- **Three RJMCMC Methods**:
   - NonLinear1: Default uniform order statistics prior
   - NonLinear2: Dirichlet-Gamma prior for knot locations
   - CoxPH: Baseline Cox proportional hazards model
@@ -18,8 +18,9 @@ Julia implementation of reversible jump MCMC survival models for simulations and
 - `config.jl`: Central defaults for simulations (`demo`/`full`) and real-data runs
 - `model.jl`: RJMCMC algorithms and utilities shared by all scripts
 - `simulation.jl`: End-to-end simulation pipeline with caching, resume support, progress bar, and thread-based parallelism
-- `real_data_GBC.jl` / `real_data_PBC.jl`: Analyses for the GBC and PBC datasets in `GermanBC/` and `PBC/`
+- `real_data_GBC.jl` / `real_data_PBC.jl`: Analyses for the GBC and PBC datasets (CSV files in the project root)
 - `install_packages.jl`: Script to install all required Julia packages
+- `table_gen.py`: Generate LaTeX simulation tables from `simu_summary.csv`
 - `boxplot.R`: R script for generating IBS boxplots (requires ggplot2)
 - `results/`: Generated outputs (gitignored)
 
@@ -27,7 +28,7 @@ Julia implementation of reversible jump MCMC survival models for simulations and
 
 ### Prerequisites
 
-- **Julia ≥1.9**: Download from [julialang.org](https://julialang.org/downloads/)
+- **Julia >= 1.9**: Download from [julialang.org](https://julialang.org/downloads/)
 - **R** (optional, for boxplot generation): Download from [r-project.org](https://www.r-project.org/)
 
 ### Install Julia Packages
@@ -92,8 +93,8 @@ $env:JULIA_NUM_THREADS=32; julia simulation.jl --full
 ### Execution Order
 
 The simulation executes tasks in a specific order:
-1. **By g_type**: `linear` → `quad` → `sin`
-2. **By n_values**: Within each g_type, tasks are processed by sample size (200 → 400 → 800)
+1. **By g_type**: `linear` -> `quad` -> `sin`
+2. **By n_values**: Within each g_type, tasks are processed by sample size (200 -> 400 -> 800)
 3. **By replication**: Within each (g_type, n) combination, replications are executed in parallel but tasks are sorted by replication index (1, 2, ..., N)
 
 This ensures that all `linear` scenarios complete before starting `quad`, and all `quad` complete before starting `sin`.
@@ -103,12 +104,12 @@ This ensures that all `linear` scenarios complete before starting `quad`, and al
 **Demo Mode** (`--demo`):
 - Sample sizes: `[200, 400, 800]`
 - Replications: `5` per scenario
-- Total tasks: 3 g_types × 3 n_values × 5 replications = **45 tasks**
+- Total tasks: 3 g_types x 3 n_values x 5 replications = **45 tasks**
 
 **Full Mode** (`--full`):
 - Sample sizes: `[200, 400, 800]`
 - Replications: `1000` per scenario
-- Total tasks: 3 g_types × 3 n_values × 1000 replications = **9000 tasks**
+- Total tasks: 3 g_types x 3 n_values x 1000 replications = **9000 tasks**
 
 ### Checkpoints and Resume
 
@@ -134,13 +135,20 @@ julia real_data_GBC.jl
 julia real_data_PBC.jl
 ```
 
-Outputs (posterior summaries, estimated g(z), IBS averages) are written to `results/real_data/gbc/` and `results/real_data/pbc/`.
+Outputs are written to `results/real_data/gbc/` and `results/real_data/pbc/`:
+- `beta_*.csv`: Posterior summaries for NonLinear1, NonLinear2, and CoxPH (columns: `Method`, `Beta`, `Pos_Mean`, `CrI_LB`, `CrI_UB`)
+- `g_*.csv`: Posterior mean of g(z) for NonLinear1 and NonLinear2 (columns: `z`, `g_non1`, `g_non2`)
+- `tau_*.csv`, `zeta_*.csv`, `HK_*.csv`: Trace storage for tau, zeta, H, and K (NonLinear1 and NonLinear2)
+- `IBS_*.csv`: Cross-validated IBS comparisons across methods
+- `g_compare_*.pdf`: NonLinear1 vs NonLinear2 g(z) plot with labeled axes
+- `z_hist_*.pdf`: Histogram of Z values used in the nonlinear term
 
 ## Dependencies
 
 See `requirements.txt` for a complete list of required packages:
 - **Julia packages**: DataFrames, CSV, Distributions, ProgressMeter, StatsBase, VectorizedStatistics, MLDataUtils, Plots, StatsPlots, CategoricalArrays, SpecialFunctions, LaTeXStrings
 - **R packages**: ggplot2 (for boxplot generation)
+- **Python packages**: pandas (for `table_gen.py`)
 
 ## Notes
 
@@ -148,3 +156,7 @@ See `requirements.txt` for a complete list of required packages:
 - On Windows PowerShell, use `$env:JULIA_NUM_THREADS=N` to set thread count.
 - The code automatically detects available threads and warns if requested threads exceed available threads.
 - For best performance, set `JULIA_NUM_THREADS` to match your CPU core count.
+
+## Contact
+
+If you have questions or run into issues, please contact zhanght@gdou.edu.cn.

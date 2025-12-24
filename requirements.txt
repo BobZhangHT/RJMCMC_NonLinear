@@ -3,15 +3,15 @@
 # Installation methods (choose one):
 # 
 # Method 1 - Windows PowerShell (recommended):
-#   julia -e "using Pkg; Pkg.add([\"DataFrames\", \"CSV\", \"Distributions\", \"ProgressMeter\", \"StatsBase\", \"VectorizedStatistics\", \"MLDataUtils\", \"Plots\", \"StatsPlots\", \"CategoricalArrays\", \"LaTeXStrings\"])"
+#   julia -e "using Pkg; Pkg.add([\"DataFrames\", \"CSV\", \"Distributions\", \"ProgressMeter\", \"StatsBase\", \"VectorizedStatistics\", \"MLDataUtils\", \"Plots\", \"StatsPlots\", \"CategoricalArrays\", \"SpecialFunctions\", \"LaTeXStrings\"])"
 # 
 # Method 2 - Interactive Julia REPL:
 #   julia
-#   ] add DataFrames CSV Distributions ProgressMeter StatsBase VectorizedStatistics MLDataUtils Plots StatsPlots CategoricalArrays LaTeXStrings
+#   ] add DataFrames CSV Distributions ProgressMeter StatsBase VectorizedStatistics MLDataUtils Plots StatsPlots CategoricalArrays SpecialFunctions LaTeXStrings
 #   (Press Ctrl+C to exit package mode, then type exit() to quit)
 # 
 # Method 3 - Create install_packages.jl script:
-#   Create a file install_packages.jl with: using Pkg; Pkg.add(["DataFrames", "CSV", "Distributions", "ProgressMeter", "StatsBase", "VectorizedStatistics", "MLDataUtils", "Plots", "StatsPlots", "CategoricalArrays", "LaTeXStrings"])
+#   Create a file install_packages.jl with: using Pkg; Pkg.add(["DataFrames", "CSV", "Distributions", "ProgressMeter", "StatsBase", "VectorizedStatistics", "MLDataUtils", "Plots", "StatsPlots", "CategoricalArrays", "SpecialFunctions", "LaTeXStrings"])
 #   Then run: julia install_packages.jl
 
 # Julia packages
@@ -26,8 +26,12 @@ MLDataUtils
 Plots
 StatsPlots
 CategoricalArrays
+SpecialFunctions
 LaTeXStrings
 
 # R packages (for boxplot generation)
 # Install with: Rscript -e "install.packages('ggplot2', repos='https://cran.rstudio.com/')"
 ggplot2
+
+# Python packages (for table_gen.py)
+pandas
