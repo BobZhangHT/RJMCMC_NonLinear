@@ -87,19 +87,22 @@ CSV.write(joinpath(base_dir, "zeta_PBC.csv"), df_zeta)
 CSV.write(joinpath(base_dir, "HK_PBC.csv"), df_hk)
 
 # Posterior summaries for regression coefficients
-function summarize_betas(betas_all, method::String)
-    betas_mean = vec(mean(betas_all, dims=2))
-    betas_lb = vec(vquantile(betas_all, 0.025, dims=2))
-    betas_ub = vec(vquantile(betas_all, 0.975, dims=2))
+function summarize_betas(betas_all, burn_in::Int, method::String)
+    ns = size(betas_all, 2)
+    start_idx = min(burn_in + 1, ns)
+    betas_use = betas_all[:, start_idx:ns]
+    betas_mean = vec(mean(betas_use, dims=2))
+    betas_lb = vec(vquantile(betas_use, 0.025, dims=2))
+    betas_ub = vec(vquantile(betas_use, 0.975, dims=2))
     return DataFrame(Method=fill(method, length(betas_mean)),
         Beta=1:length(betas_mean),
         Pos_Mean=betas_mean, CrI_LB=betas_lb, CrI_UB=betas_ub)
 end
 
 df_beta = vcat(
-    summarize_betas(results["betas"], "NonLinear1"),
-    summarize_betas(results_dirichlet["betas"], "NonLinear2"),
-    summarize_betas(results_coxph["betas"], "CoxPH")
+    summarize_betas(results["betas"], results["burn_in"], "NonLinear1"),
+    summarize_betas(results_dirichlet["betas"], results_dirichlet["burn_in"], "NonLinear2"),
+    summarize_betas(results_coxph["betas"], results_coxph["burn_in"], "CoxPH")
 )
 CSV.write(joinpath(base_dir, "beta_PBC.csv"), df_beta)
 
